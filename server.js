@@ -1,212 +1,153 @@
-require("dotenv").config({ path: ".env.local" });
 const express = require("express");
 const twilio = require("twilio");
-const bcrypt = require("bcryptjs");
-const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
+const bcrypt = require("bcryptjs");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
+// ---- Supabase connection ----
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const MAX_ATTEMPTS = 3;
-const LOCK_MINUTES = 5;
-
-async function getOrCreateUser(whatsappNumber) {
-  let { data: user } = await supabase
-    .from("users")
-    .select("*")
-    .eq("whatsapp_number", whatsappNumber)
-    .single();
-
-  if (!user) {
-    const { data: newUser } = await supabase
-      .from("users")
-      .insert({ whatsapp_number: whatsappNumber })
-      .select()
-      .single();
-
-    user = newUser;
-    await supabase.from("wallets").insert({ user_id: user.id, balance_kobo: 0 });
-  }
-
-  return user;
-}
-
-async function updateUser(userId, fields) {
-  await supabase.from("users").update(fields).eq("id", userId);
-}
-
-async function getWalletBalance(userId) {
-  const { data: wallet } = await supabase
-    .from("wallets")
-    .select("balance_kobo")
-    .eq("user_id", userId)
-    .single();
-
-  return wallet ? wallet.balance_kobo : 0;
-}
-
-function isValidPinFormat(text) {
-  return /^\d{4}$/.test(text);
-}
-
-function isValidAmount(text) {
-  return /^\d+$/.test(text) && parseInt(text, 10) >= 100;
-}
-
-function isLocked(user) {
-  return user.locked_until && new Date(user.locked_until) > new Date();
-}
-
-async function createPaystackPaymentLink(user, amountKobo) {
-  const reference = `credafi_${user.id.slice(0, 8)}_${Date.now()}`;
-  const fakeEmail = `${user.whatsapp_number.replace(/\D/g, "")}@credafi.temp`;
-
-  const response = await axios.post(
-    "https://api.paystack.co/transaction/initialize",
-    {
-      email: fakeEmail,
-      amount: amountKobo,
-      reference: reference,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-
-  await supabase.from("pending_payments").insert({
-    reference: reference,
-    user_id: user.id,
-    amount_kobo: amountKobo,
-    status: "pending",
-  });
-
-  return response.data.data.authorization_url;
-}
-
+// ---- Main webhook Twilio calls on every incoming WhatsApp message ----
 app.post("/api/whatsapp", async (req, res) => {
   const incomingMessage = (req.body.Body || "").trim();
-  const senderNumber = req.body.From;
+  const from = req.body.From; // e.g. "whatsapp:+2348169945302"
 
   const twiml = new twilio.twiml.MessagingResponse();
 
   try {
-    let user = await getOrCreateUser(senderNumber);
+    // 1. Find this user, or create a new row if they've never messaged before
+    let { data: user, error: findError } = await supabase
+      .from("users")
+      .select("*")
+      .eq("whatsapp_number", from)
+      .single();
 
-    if (isLocked(user)) {
-      const minutesLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
-      twiml.message(`Too many wrong PIN attempts. Please try again in ${minutesLeft} minute(s).`);
+    if (findError && findError.code !== "PGRST116") {
+      // PGRST116 = "no row found", which is fine for a brand new user.
+      // Any other error means something is actually wrong with the connection/table.
+      console.log("USER LOOKUP ERROR:", findError);
+      twiml.message("Something went wrong on our end. Please try again shortly.");
       res.set("Content-Type", "text/xml");
       return res.send(twiml.toString());
     }
 
-    if (!user.pin_hash && user.conversation_state !== "awaiting_pin_setup" && user.conversation_state !== "awaiting_pin_confirm") {
-      await updateUser(user.id, { conversation_state: "awaiting_pin_setup" });
+    if (!user) {
+      const { data: newUser, error: insertError } = await supabase
+        .from("users")
+        .insert({ whatsapp_number: from, conversation_state: "awaiting_pin_setup" })
+        .select()
+        .single();
+
+      console.log("NEW USER CREATED:", { newUser, insertError });
+
+      if (insertError) {
+        twiml.message("Something went wrong setting up your account. Please try again.");
+        res.set("Content-Type", "text/xml");
+        return res.send(twiml.toString());
+      }
+
+      user = newUser;
       twiml.message("Welcome to Credafi! To get started, please set a 4-digit PIN to secure your account. Reply with 4 digits (e.g. 1234).");
       res.set("Content-Type", "text/xml");
       return res.send(twiml.toString());
     }
 
-    if (user.conversation_state === "awaiting_pin_setup") {
-      if (!isValidPinFormat(incomingMessage)) {
+    const state = user.conversation_state;
+
+    // 2. Route the message based on where this user currently is in the flow
+    if (state === "awaiting_pin_setup") {
+      if (!/^\d{4}$/.test(incomingMessage)) {
         twiml.message("That doesn't look like a valid PIN. Please reply with exactly 4 digits (e.g. 1234).");
       } else {
-        await updateUser(user.id, { conversation_state: `awaiting_pin_confirm:${incomingMessage}` });
-        twiml.message("Please re-enter your 4-digit PIN to confirm it.");
-      }
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml.toString());
-    }
+        // Temporarily store the PIN attempt in conversation_state so we can compare it on confirm.
+        // (We do NOT hash it yet — we hash only once it's confirmed, below.)
+        const { data, error } = await supabase
+          .from("users")
+          .update({
+            conversation_state: `awaiting_pin_confirm:${incomingMessage}`,
+          })
+          .eq("whatsapp_number", from);
 
-    if (user.conversation_state && user.conversation_state.startsWith("awaiting_pin_confirm:")) {
-      const firstPin = user.conversation_state.split(":")[1];
+        console.log("PIN FIRST ENTRY SAVE:", { data, error });
 
-      if (incomingMessage !== firstPin) {
-        await updateUser(user.id, { conversation_state: "awaiting_pin_setup" });
-        twiml.message("PINs didn't match. Let's try again — reply with a 4-digit PIN.");
-      } else {
-        const hashedPin = await bcrypt.hash(firstPin, 10);
-        await updateUser(user.id, { pin_hash: hashedPin, conversation_state: null });
-        twiml.message("PIN set successfully! Reply:\n1. Check balance\n2. Fund wallet\n3. Send money");
-      }
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml.toString());
-    }
-
-    // PIN verify, then branch based on what they were trying to do
-    if (user.conversation_state && user.conversation_state.startsWith("awaiting_pin_verify:")) {
-      const nextAction = user.conversation_state.split(":")[1];
-      const pinMatches = await bcrypt.compare(incomingMessage, user.pin_hash);
-
-      if (!pinMatches) {
-        const newAttempts = (user.failed_pin_attempts || 0) + 1;
-
-        if (newAttempts >= MAX_ATTEMPTS) {
-          const lockUntil = new Date(Date.now() + LOCK_MINUTES * 60000).toISOString();
-          await updateUser(user.id, { failed_pin_attempts: 0, locked_until: lockUntil, conversation_state: null });
-          twiml.message(`Wrong PIN too many times. Account locked for ${LOCK_MINUTES} minutes.`);
+        if (error) {
+          twiml.message("Something went wrong saving your PIN. Please try again.");
         } else {
-          await updateUser(user.id, { failed_pin_attempts: newAttempts });
-          twiml.message(`Incorrect PIN. ${MAX_ATTEMPTS - newAttempts} attempt(s) left.`);
+          twiml.message("Please re-enter your 4-digit PIN to confirm it.");
         }
-        res.set("Content-Type", "text/xml");
-        return res.send(twiml.toString());
       }
+    } else if (state && state.startsWith("awaiting_pin_confirm:")) {
+      const pendingPin = state.split(":")[1];
 
-      await updateUser(user.id, { failed_pin_attempts: 0 });
+      if (incomingMessage !== pendingPin) {
+        // Confirmation didn't match — send them back to the start of PIN setup.
+        const { data, error } = await supabase
+          .from("users")
+          .update({ conversation_state: "awaiting_pin_setup" })
+          .eq("whatsapp_number", from);
 
-      if (nextAction === "fund") {
-        await updateUser(user.id, { conversation_state: "awaiting_fund_amount" });
-        twiml.message("How much would you like to fund? Reply with an amount in Naira (e.g. 1000 for ₦1,000).");
-      } else if (nextAction === "send") {
-        await updateUser(user.id, { conversation_state: null });
-        twiml.message("PIN verified! (Send money feature coming soon.)");
-      }
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml.toString());
-    }
+        console.log("PIN MISMATCH RESET:", { data, error });
 
-    // Amount entry for funding
-    if (user.conversation_state === "awaiting_fund_amount") {
-      if (!isValidAmount(incomingMessage)) {
-        twiml.message("Please enter a valid amount in Naira (minimum ₦1), numbers only, e.g. 1000.");
+        twiml.message("PINs didn't match. Let's try again — reply with a new 4-digit PIN (e.g. 1234).");
       } else {
-        const amountKobo = parseInt(incomingMessage, 10) * 100;
-        const paymentUrl = await createPaystackPaymentLink(user, amountKobo);
-        await updateUser(user.id, { conversation_state: null });
-        twiml.message(`Tap this link to complete your ₦${incomingMessage} payment:\n${paymentUrl}\n\nYour balance will update automatically once payment is confirmed.`);
-      }
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml.toString());
-    }
+        const hashedPin = await bcrypt.hash(incomingMessage, 10);
 
-    // Normal menu
-    if (incomingMessage.toLowerCase() === "hi") {
-      twiml.message("Welcome back to Credafi! Reply:\n1. Check balance\n2. Fund wallet\n3. Send money");
-    } else if (incomingMessage === "1") {
-      const balanceKobo = await getWalletBalance(user.id);
-      const balanceNaira = (balanceKobo / 100).toFixed(2);
-      twiml.message(`Your balance is ₦${balanceNaira}`);
-    } else if (incomingMessage === "2") {
-      await updateUser(user.id, { conversation_state: "awaiting_pin_verify:fund" });
-      twiml.message("Please enter your 4-digit PIN to continue.");
-    } else if (incomingMessage === "3") {
-      await updateUser(user.id, { conversation_state: "awaiting_pin_verify:send" });
-      twiml.message("Please enter your 4-digit PIN to continue.");
+        const { data, error } = await supabase
+          .from("users")
+          .update({
+            pin_hash: hashedPin,
+            conversation_state: "main_menu",
+          })
+          .eq("whatsapp_number", from);
+
+        console.log("PIN CONFIRMED SAVE:", { data, error });
+
+        if (error) {
+          twiml.message("Something went wrong saving your PIN. Please try again.");
+        } else {
+          twiml.message(
+            "Your PIN is set! Welcome to Credafi. Reply:\n1. Check balance\n2. Send money\n3. Fund account"
+          );
+        }
+      }
+    } else if (state === "main_menu") {
+      if (incomingMessage === "1") {
+        const { data: wallet, error } = await supabase
+          .from("wallets")
+          .select("balance")
+          .eq("whatsapp_number", from)
+          .single();
+
+        console.log("BALANCE LOOKUP:", { wallet, error });
+
+        const balanceNaira = wallet ? (wallet.balance / 100).toFixed(2) : "0.00";
+        twiml.message(`Your balance is ₦${balanceNaira}`);
+      } else if (incomingMessage === "2") {
+        twiml.message("Send money flow is coming soon.");
+      } else if (incomingMessage === "3") {
+        twiml.message("Fund account flow is coming soon.");
+      } else if (incomingMessage.toLowerCase() === "menu") {
+        twiml.message("Reply:\n1. Check balance\n2. Send money\n3. Fund account");
+      } else {
+        twiml.message("Sorry, I didn't understand that. Reply 'menu' to see your options.");
+      }
     } else {
-      twiml.message("Sorry, I didn't understand that. Reply 'hi' to start.");
+      // Fallback for any unexpected state — reset them safely to the menu.
+      await supabase
+        .from("users")
+        .update({ conversation_state: "main_menu" })
+        .eq("whatsapp_number", from);
+
+      twiml.message("Reply:\n1. Check balance\n2. Send money\n3. Fund account");
     }
-  } catch (error) {
-    console.error("Error:", error);
-    twiml.message("Something went wrong. Please try again.");
+  } catch (err) {
+    console.log("UNEXPECTED ERROR:", err);
+    twiml.message("Something went wrong. Please try again shortly.");
   }
 
   res.set("Content-Type", "text/xml");
