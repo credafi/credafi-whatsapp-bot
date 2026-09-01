@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const MENU_TEXT =
-  "CredAfri\nWhat do you want to do?\n" +
+  "Welcome\nWhat do you want to do?\n" +
   "1. Check balance\n2. Fund wallet\n3. Send money\n4. Beneficiaries\n" +
   "5. Transaction history\n6. Account details\n7. Verify bank account\n" +
   "8. Verify identity\n9. Help";
