@@ -115,7 +115,17 @@ app.post("/api/whatsapp", async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    const state = user.conversation_state || "";
+    const state = user.conversation_state || "";   // ---------------- UNIVERSAL 'MENU' ESCAPE HATCH ----------------
+   if (
+     incomingMessage.toLowerCase() === "menu" &&
+     state !== "awaiting_pin_setup" &&
+     !state.startsWith("awaiting_pin_confirm:")
+   ) {
+     await setState(from, "main_menu");
+     twiml.message(MENU_TEXT);
+     res.set("Content-Type", "text/xml");
+     return res.send(twiml.toString());
+   }
 
     // ---------------- PIN SETUP ----------------
     if (state === "awaiting_pin_setup") {
