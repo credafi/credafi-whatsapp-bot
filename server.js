@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const MENU_TEXT =
-  "Welcome\nWhat do you want to do?\n" +
+  "CredAfri\nWhat do you want to do?\n" +
   "1. Check balance\n2. Fund wallet\n3. Send money\n4. Beneficiaries\n" +
   "5. Transaction history\n6. Account details\n7. Verify bank account\n" +
   "8. Verify identity\n9. Help";
@@ -40,8 +40,10 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res)
       const reference = event.data.reference;
       const amountKobo = event.data.amount;
 
-      const { data: pending } = await supabase
+      const { data: pending, error: pendingError } = await supabase
         .from("pending_payments").select("*").eq("reference", reference).single();
+
+      console.log("PENDING PAYMENT LOOKUP:", { reference, pending, pendingError });
 
       if (pending && pending.status !== "success") {
         const whatsappNumber = pending.whatsapp_number;
@@ -62,12 +64,7 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res)
     res.sendStatus(200);
   } catch (err) {
     console.log("PAYSTACK WEBHOOK ERROR:", err);
-    res.sendStatus(500);const { data: pending, error: pendingError } = await supabase
-  .from("pending_payments").select("*").eq("reference", reference).single();
-
-console.log("PENDING PAYMENT LOOKUP:", { reference, pending, pendingError });
-
-if (pending && pending.status !== "success") {
+    res.sendStatus(500);
   }
 });
 
@@ -126,17 +123,23 @@ app.post("/api/whatsapp", async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    const state = user.conversation_state || "";   // ---------------- UNIVERSAL 'MENU' ESCAPE HATCH ----------------
-   if (
-     incomingMessage.toLowerCase() === "menu" &&
-     state !== "awaiting_pin_setup" &&
-     !state.startsWith("awaiting_pin_confirm:")
-   ) {
-     await setState(from, "main_menu");
-     twiml.message(MENU_TEXT);
-     res.set("Content-Type", "text/xml");
-     return res.send(twiml.toString());
-   }
+    const state = user.conversation_state || "";
+
+    // ---------------- UNIVERSAL 'MENU' ESCAPE HATCH ----------------
+    // Typing 'menu' always cancels whatever flow you're mid-way through
+    // and resets to the main menu — except during PIN setup/confirm,
+    // since a PIN could legitimately contain digits that spell nothing here,
+    // but we still don't want 'menu' hijacked as a PIN attempt either.
+    if (
+      incomingMessage.toLowerCase() === "menu" &&
+      state !== "awaiting_pin_setup" &&
+      !state.startsWith("awaiting_pin_confirm:")
+    ) {
+      await setState(from, "main_menu");
+      twiml.message(MENU_TEXT);
+      res.set("Content-Type", "text/xml");
+      return res.send(twiml.toString());
+    }
 
     // ---------------- PIN SETUP ----------------
     if (state === "awaiting_pin_setup") {
@@ -264,22 +267,22 @@ app.post("/api/whatsapp", async (req, res) => {
 
     // ---------------- SEND MONEY ----------------
     } else if (state === "awaiting_send_recipient") {
-  const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from);
-  const selectionIndex = parseInt(incomingMessage, 10);
-  let recipientNumber;
+      const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from);
+      const selectionIndex = parseInt(incomingMessage, 10);
+      let recipientNumber;
 
-  if (
-    beneficiaries && beneficiaries.length > 0 &&
-    /^\d{1,2}$/.test(incomingMessage) &&
-    selectionIndex >= 1 && selectionIndex <= beneficiaries.length
-  ) {
-    recipientNumber = beneficiaries[selectionIndex - 1].beneficiary_number;
-  } else {
-    const digitsOnly = incomingMessage.replace(/\D/g, "");
-    recipientNumber = `whatsapp:+${digitsOnly}`;
-  }
+      if (
+        beneficiaries && beneficiaries.length > 0 &&
+        /^\d{1,2}$/.test(incomingMessage) &&
+        selectionIndex >= 1 && selectionIndex <= beneficiaries.length
+      ) {
+        recipientNumber = beneficiaries[selectionIndex - 1].beneficiary_number;
+      } else {
+        const digitsOnly = incomingMessage.replace(/\D/g, "");
+        recipientNumber = `whatsapp:+${digitsOnly}`;
+      }
 
-  if (recipientNumber === from) {
+      if (recipientNumber === from) {
         twiml.message("You can't send money to yourself. Reply with a different number, or 'menu' to cancel.");
       } else {
         const { data: recipient } = await supabase.from("users").select("whatsapp_number").eq("whatsapp_number", recipientNumber).single();
@@ -352,7 +355,10 @@ app.post("/api/whatsapp", async (req, res) => {
             { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
           );
           const authUrl = paystackResponse.data.data.authorization_url;
-          await supabase.from("pending_payments").insert({ whatsapp_number: from, reference, amount: amountKobo, status: "pending" });
+          const { error: pendingError } = await supabase
+            .from("pending_payments")
+            .insert({ whatsapp_number: from, reference, amount_kobo: amountKobo, status: "pending" });
+          console.log("PENDING PAYMENT CREATED:", { pendingError });
           twiml.message(`Tap the link below to complete your payment of N${amountNaira.toFixed(2)}:\n${authUrl}`);
         } catch (err) {
           console.log("PAYSTACK INIT ERROR:", err.response ? err.response.data : err.message);
