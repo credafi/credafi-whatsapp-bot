@@ -48,9 +48,9 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res)
       if (pending && pending.status !== "success") {
         const whatsappNumber = pending.whatsapp_number;
         const wallet = await getOrCreateWallet(whatsappNumber);
-        const newBalance = wallet.balance + amountKobo;
+        const newBalance = wallet.balance_kobo + amountKobo;
 
-        await supabase.from("wallets").update({ balance: newBalance }).eq("whatsapp_number", whatsappNumber);
+        await supabase.from("wallets").update({ balance_kobo: newBalance }).eq("whatsapp_number", whatsappNumber);
         await supabase.from("pending_payments").update({ status: "success" }).eq("reference", reference);
         await logTransaction(whatsappNumber, "fund", amountKobo, null, reference);
 
@@ -81,10 +81,10 @@ async function getOrCreateWallet(whatsappNumber) {
   if (wallet) return wallet;
 
   const { data: newWallet, error: insertError } = await supabase
-    .from("wallets").insert({ whatsapp_number: whatsappNumber, balance: 0 }).select().single();
+    .from("wallets").insert({ whatsapp_number: whatsappNumber, balance_kobo: 0 }).select().single();
 
   if (insertError) console.log("WALLET CREATE ERROR:", insertError);
-  return newWallet || { whatsapp_number: whatsappNumber, balance: 0 };
+  return newWallet || { whatsapp_number: whatsappNumber, balance_kobo: 0 };
 }
 
 async function logTransaction(whatsappNumber, type, amountKobo, counterparty, reference) {
@@ -166,7 +166,7 @@ app.post("/api/whatsapp", async (req, res) => {
     } else if (state === "main_menu") {
       if (incomingMessage === "1") {
         const wallet = await getOrCreateWallet(from);
-        twiml.message(`Your balance is N${(wallet.balance / 100).toFixed(2)}`);
+        twiml.message(`Your balance is N${(wallet.balance_kobo / 100).toFixed(2)}`);
 
       } else if (incomingMessage === "2") {
         await setState(from, "awaiting_fund_amount");
@@ -213,7 +213,7 @@ app.post("/api/whatsapp", async (req, res) => {
         twiml.message(
           `Account details:\nNumber: ${from.replace("whatsapp:", "")}\n` +
           `Name: ${user.full_name || "(not set)"}\n` +
-          `Balance: N${(wallet.balance / 100).toFixed(2)}\n` +
+          `Balance: N${(wallet.balance_kobo / 100).toFixed(2)}\n` +
           `Bank verified: ${user.bank_account_number ? `Yes (${user.bank_name}, ${user.account_name})` : "No"}\n` +
           `BVN verified: ${user.bvn_verified ? "Yes" : "No"}\n` +
           `NIN verified: ${user.nin_verified ? "Yes" : "No"}`
@@ -302,8 +302,8 @@ app.post("/api/whatsapp", async (req, res) => {
       } else {
         const amountKobo = Math.round(amountNaira * 100);
         const senderWallet = await getOrCreateWallet(from);
-        if (senderWallet.balance < amountKobo) {
-          twiml.message(`Insufficient balance. Current balance: N${(senderWallet.balance / 100).toFixed(2)}. Reply 'menu' to go back.`);
+        if (senderWallet.balance_kobo < amountKobo) {
+          twiml.message(`Insufficient balance. Current balance: N${(senderWallet.balance_kobo / 100).toFixed(2)}. Reply 'menu' to go back.`);
           await setState(from, "main_menu");
         } else {
           await setState(from, `awaiting_send_pin:${recipientNumber}:${amountKobo}`);
@@ -321,12 +321,12 @@ app.post("/api/whatsapp", async (req, res) => {
         twiml.message("Incorrect PIN. Transfer cancelled. Reply 'menu' to try again.");
       } else {
         const senderWallet = await getOrCreateWallet(from);
-        if (senderWallet.balance < amountKobo) {
+        if (senderWallet.balance_kobo < amountKobo) {
           twiml.message("Insufficient balance. Transfer cancelled.");
         } else {
           const recipientWallet = await getOrCreateWallet(recipientNumber);
-          await supabase.from("wallets").update({ balance: senderWallet.balance - amountKobo }).eq("whatsapp_number", from);
-          await supabase.from("wallets").update({ balance: recipientWallet.balance + amountKobo }).eq("whatsapp_number", recipientNumber);
+          await supabase.from("wallets").update({ balance_kobo: senderWallet.balance_kobo - amountKobo }).eq("whatsapp_number", from);
+          await supabase.from("wallets").update({ balance_kobo: recipientWallet.balance_kobo + amountKobo }).eq("whatsapp_number", recipientNumber);
           await logTransaction(from, "send", amountKobo, recipientNumber, null);
           await logTransaction(recipientNumber, "receive", amountKobo, from, null);
 
