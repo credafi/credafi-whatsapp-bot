@@ -11,7 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const MENU_TEXT =
-  "CredAfri\nWhat do you want to do?\n" +
+  "Welcome\nWhat do you want to do?\n" +
   "1. Check balance\n2. Fund wallet\n3. Send money\n4. Beneficiaries\n" +
   "5. Transaction history\n6. Account details\n7. Verify bank account\n" +
   "8. Verify identity\n9. Help";
@@ -224,8 +224,13 @@ app.post("/api/whatsapp", async (req, res) => {
         twiml.message("Reply with your bank's code (e.g. 058 for GTBank, 044 for Access Bank). Reply 'banks' if you need the full list.");
 
       } else if (incomingMessage === "8") {
-        await setState(from, "awaiting_bvn");
-        twiml.message("Let's verify your identity. Reply with your 11-digit BVN.");
+        if (!user.full_name) {
+          await setState(from, "awaiting_full_name_for_identity");
+          twiml.message("Let's verify your identity. First, what's your full name (First Last), exactly as it appears on your BVN/NIN records?");
+        } else {
+          await setState(from, "awaiting_bvn");
+          twiml.message(`Verifying as ${user.full_name}. Reply with your 11-digit BVN.`);
+        }
 
       } else if (incomingMessage === "9") {
         twiml.message(
@@ -404,30 +409,52 @@ app.post("/api/whatsapp", async (req, res) => {
         twiml.message("Couldn't verify that account. Double check the bank code and account number, then try again from the menu.");
       }
 
-    // ---------------- VERIFY IDENTITY (BVN then NIN) ----------------
-    // NOTE: Paystack does not verify BVN/NIN directly. This calls a generic
-    // placeholder endpoint — sign up with a provider (QoreID, Youverify, or
-    // Prembly all work well for Nigeria) and set IDENTITY_API_URL and
-    // IDENTITY_API_KEY in Render. Adjust the field names below (idNumber,
-    // firstName etc.) to match whichever provider's actual response shape.
+    // ---------------- VERIFY IDENTITY (name, then BVN, then NIN via QoreID) ----------------
+    } else if (state === "awaiting_full_name_for_identity") {
+      const fullName = incomingMessage.trim();
+      if (fullName.split(" ").length < 2) {
+        twiml.message("Please reply with both your first and last name (e.g. Ada Okafor).");
+      } else {
+        await supabase.from("users").update({ full_name: fullName }).eq("whatsapp_number", from);
+        await setState(from, "awaiting_bvn");
+        twiml.message(`Thanks, ${fullName}. Now reply with your 11-digit BVN.`);
+      }
+
     } else if (state === "awaiting_bvn") {
       const bvn = incomingMessage.replace(/\D/g, "");
       if (bvn.length !== 11) {
         twiml.message("BVN should be exactly 11 digits. Please try again.");
       } else {
+        const [firstname, ...rest] = user.full_name.split(" ");
+        const lastname = rest.join(" ");
         try {
-          await axios.post(
-            process.env.IDENTITY_API_URL + "/bvn",
-            { idNumber: bvn },
-            { headers: { Authorization: `Bearer ${process.env.IDENTITY_API_KEY}` } }
+          const tokenResp = await axios.post("https://api.qoreid.com/token", {
+            clientId: process.env.QOREID_CLIENT_ID,
+            secret: process.env.QOREID_CLIENT_SECRET,
+          });
+          const accessToken = tokenResp.data.accessToken;
+
+          const verifyResp = await axios.post(
+            `https://api.qoreid.com/v1/ng/identities/bvn-basic/${bvn}`,
+            { firstname, lastname },
+            { headers: { Authorization: `Bearer ${accessToken}` } }
           );
-          // We deliberately do NOT store the raw BVN — only that it passed.
-          await supabase.from("users").update({ bvn_verified: true }).eq("whatsapp_number", from);
-          await setState(from, "awaiting_nin");
-          twiml.message("BVN verified! Now reply with your 11-digit NIN.");
+
+          const matched = verifyResp.data.summary && verifyResp.data.summary.bvn_check
+            ? verifyResp.data.summary.bvn_check.status === "EXACT_MATCH"
+            : true; // some QoreID responses don't include a match summary for basic lookups
+
+          if (!matched) {
+            twiml.message("That BVN didn't match the name on file. Please double check and try again, or reply 'menu' to cancel.");
+          } else {
+            // We deliberately do NOT store the raw BVN — only that it passed.
+            await supabase.from("users").update({ bvn_verified: true }).eq("whatsapp_number", from);
+            await setState(from, "awaiting_nin");
+            twiml.message("BVN verified! Now reply with your 11-digit NIN.");
+          }
         } catch (err) {
           console.log("BVN VERIFY ERROR:", err.response ? err.response.data : err.message);
-          twiml.message("We couldn't verify that BVN. Please check the number and try again, or reply 'menu' to cancel.");
+          twiml.message("We couldn't verify that BVN right now. Please check the number and try again, or reply 'menu' to cancel.");
         }
       }
 
@@ -436,18 +463,35 @@ app.post("/api/whatsapp", async (req, res) => {
       if (nin.length !== 11) {
         twiml.message("NIN should be exactly 11 digits. Please try again.");
       } else {
+        const [firstname, ...rest] = user.full_name.split(" ");
+        const lastname = rest.join(" ");
         try {
-          await axios.post(
-            process.env.IDENTITY_API_URL + "/nin",
-            { idNumber: nin },
-            { headers: { Authorization: `Bearer ${process.env.IDENTITY_API_KEY}` } }
+          const tokenResp = await axios.post("https://api.qoreid.com/token", {
+            clientId: process.env.QOREID_CLIENT_ID,
+            secret: process.env.QOREID_CLIENT_SECRET,
+          });
+          const accessToken = tokenResp.data.accessToken;
+
+          const verifyResp = await axios.post(
+            `https://api.qoreid.com/v1/ng/identities/nin/${nin}`,
+            { firstname, lastname },
+            { headers: { Authorization: `Bearer ${accessToken}` } }
           );
-          await supabase.from("users").update({ nin_verified: true }).eq("whatsapp_number", from);
-          await setState(from, "main_menu");
-          twiml.message("Identity verified! Reply 'menu' to continue.");
+
+          const matched = verifyResp.data.summary && verifyResp.data.summary.nin_check
+            ? verifyResp.data.summary.nin_check.status === "EXACT_MATCH"
+            : true;
+
+          if (!matched) {
+            twiml.message("That NIN didn't match the name on file. Please double check and try again, or reply 'menu' to cancel.");
+          } else {
+            await supabase.from("users").update({ nin_verified: true }).eq("whatsapp_number", from);
+            await setState(from, "main_menu");
+            twiml.message("Identity verified! Reply 'menu' to continue.");
+          }
         } catch (err) {
           console.log("NIN VERIFY ERROR:", err.response ? err.response.data : err.message);
-          twiml.message("We couldn't verify that NIN. Please check the number and try again, or reply 'menu' to cancel.");
+          twiml.message("We couldn't verify that NIN right now. Please check the number and try again, or reply 'menu' to cancel.");
         }
       }
 
