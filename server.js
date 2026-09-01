@@ -36,14 +36,12 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res)
     const event = JSON.parse(req.body.toString());
     console.log("PAYSTACK WEBHOOK EVENT:", event.event);
 
-    if (event.event === "charge.success") {
-      const reference = event.data.reference;
-      const amountKobo = event.data.amount;
+    const { data: pending, error: pendingError } = await supabase
+  .from("pending_payments").select("*").eq("reference", reference).single();
 
-      const { data: pending } = await supabase
-        .from("pending_payments").select("*").eq("reference", reference).single();
+console.log("PENDING PAYMENT LOOKUP:", { reference, pending, pendingError });
 
-      if (pending && pending.status !== "success") {
+if (pending && pending.status !== "success") {
         const whatsappNumber = pending.whatsapp_number;
         const wallet = await getOrCreateWallet(whatsappNumber);
         const newBalance = wallet.balance + amountKobo;
