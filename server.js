@@ -36,12 +36,14 @@ app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res)
     const event = JSON.parse(req.body.toString());
     console.log("PAYSTACK WEBHOOK EVENT:", event.event);
 
-    const { data: pending, error: pendingError } = await supabase
-  .from("pending_payments").select("*").eq("reference", reference).single();
+    if (event.event === "charge.success") {
+      const reference = event.data.reference;
+      const amountKobo = event.data.amount;
 
-console.log("PENDING PAYMENT LOOKUP:", { reference, pending, pendingError });
+      const { data: pending } = await supabase
+        .from("pending_payments").select("*").eq("reference", reference).single();
 
-if (pending && pending.status !== "success") {
+      if (pending && pending.status !== "success") {
         const whatsappNumber = pending.whatsapp_number;
         const wallet = await getOrCreateWallet(whatsappNumber);
         const newBalance = wallet.balance + amountKobo;
@@ -60,7 +62,12 @@ if (pending && pending.status !== "success") {
     res.sendStatus(200);
   } catch (err) {
     console.log("PAYSTACK WEBHOOK ERROR:", err);
-    res.sendStatus(500);
+    res.sendStatus(500);const { data: pending, error: pendingError } = await supabase
+  .from("pending_payments").select("*").eq("reference", reference).single();
+
+console.log("PENDING PAYMENT LOOKUP:", { reference, pending, pendingError });
+
+if (pending && pending.status !== "success") {
   }
 });
 
