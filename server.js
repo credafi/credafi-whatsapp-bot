@@ -72,11 +72,17 @@ app.use(express.urlencoded({ extended: false }));
 // Helpers
 // ---------------------------------------------------------------------
 async function getOrCreateWallet(whatsappNumber) {
-  const { data: wallet } = await supabase.from("wallets").select("*").eq("whatsapp_number", whatsappNumber).single();
+  const { data: wallet, error: findError } = await supabase
+    .from("wallets").select("*").eq("whatsapp_number", whatsappNumber).maybeSingle();
+
+  if (findError) console.log("WALLET LOOKUP ERROR:", findError);
   if (wallet) return wallet;
-  const { data: newWallet } = await supabase
+
+  const { data: newWallet, error: insertError } = await supabase
     .from("wallets").insert({ whatsapp_number: whatsappNumber, balance: 0 }).select().single();
-  return newWallet;
+
+  if (insertError) console.log("WALLET CREATE ERROR:", insertError);
+  return newWallet || { whatsapp_number: whatsappNumber, balance: 0 };
 }
 
 async function logTransaction(whatsappNumber, type, amountKobo, counterparty, reference) {
@@ -253,10 +259,22 @@ app.post("/api/whatsapp", async (req, res) => {
 
     // ---------------- SEND MONEY ----------------
     } else if (state === "awaiting_send_recipient") {
-      const digitsOnly = incomingMessage.replace(/\D/g, "");
-      const recipientNumber = `whatsapp:+${digitsOnly}`;
+  const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from);
+  const selectionIndex = parseInt(incomingMessage, 10);
+  let recipientNumber;
 
-      if (recipientNumber === from) {
+  if (
+    beneficiaries && beneficiaries.length > 0 &&
+    /^\d{1,2}$/.test(incomingMessage) &&
+    selectionIndex >= 1 && selectionIndex <= beneficiaries.length
+  ) {
+    recipientNumber = beneficiaries[selectionIndex - 1].beneficiary_number;
+  } else {
+    const digitsOnly = incomingMessage.replace(/\D/g, "");
+    recipientNumber = `whatsapp:+${digitsOnly}`;
+  }
+
+  if (recipientNumber === from) {
         twiml.message("You can't send money to yourself. Reply with a different number, or 'menu' to cancel.");
       } else {
         const { data: recipient } = await supabase.from("users").select("whatsapp_number").eq("whatsapp_number", recipientNumber).single();
