@@ -4,6 +4,7 @@ const { createClient } = require("@supabase/supabase-js");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const axios = require("axios");
+const { OpenAI, toFile } = require("openai");
 
 const app = express();
 
@@ -16,6 +17,8 @@ const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MENU_TEXT =
   "Welcome\nWhat do you want to do?\n" +
@@ -119,6 +122,77 @@ app.post(
 // ---------------------------------------------------------------------
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// ---------------------------------------------------------------------
+// PIN SAFETY — voice notes can never be used to enter a PIN
+// ---------------------------------------------------------------------
+function isPinState(state) {
+  return (
+    state === "awaiting_pin_setup" ||
+    state.startsWith("awaiting_pin_confirm:") ||
+    state.startsWith("awaiting_send_pin:")
+  );
+}
+
+// ---------------------------------------------------------------------
+// VOICE + IMAGE HELPERS
+// ---------------------------------------------------------------------
+async function transcribeAudioBuffer(buffer, filename) {
+  const file = await toFile(buffer, filename);
+  const transcription = await openai.audio.transcriptions.create({
+    file,
+    model: "whisper-1",
+  });
+  return transcription.text.trim();
+}
+
+async function analyzeImageBuffer(buffer, mimeType) {
+  const base64Image = buffer.toString("base64");
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              "Describe what is in this image in 1-2 short sentences, then clearly list any text, numbers, account numbers, amounts, or names visible in it. Keep it concise, formatted for a WhatsApp/Telegram chat message.",
+          },
+          {
+            type: "image_url",
+            image_url: { url: `data:${mimeType};base64,${base64Image}` },
+          },
+        ],
+      },
+    ],
+  });
+
+  return response.choices[0].message.content;
+}
+
+async function downloadTwilioMedia(url) {
+  const response = await axios.get(url, {
+    responseType: "arraybuffer",
+    auth: {
+      username: process.env.TWILIO_ACCOUNT_SID,
+      password: process.env.TWILIO_AUTH_TOKEN,
+    },
+  });
+  return Buffer.from(response.data);
+}
+
+async function downloadTelegramFile(fileId) {
+  const fileInfoResp = await axios.get(
+    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getFile`,
+    { params: { file_id: fileId } }
+  );
+  const filePath = fileInfoResp.data.result.file_path;
+  const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${filePath}`;
+  const response = await axios.get(fileUrl, { responseType: "arraybuffer" });
+  return Buffer.from(response.data);
+}
 
 // ---------------------------------------------------------------------
 // HELPERS
@@ -296,9 +370,9 @@ async function initiatePaystackTransfer(
 
 // ---------------------------------------------------------------------
 // CORE MESSAGE HANDLER
-// Shared by WhatsApp and Telegram
+// Shared by WhatsApp and Telegram — options.isVoice blocks PIN entry
 // ---------------------------------------------------------------------
-async function handleIncomingMessage(from, incomingMessage) {
+async function handleIncomingMessage(from, incomingMessage, options = {}) {
   let replyText = "";
 
   try {
@@ -314,6 +388,10 @@ async function handleIncomingMessage(from, incomingMessage) {
     }
 
     if (!user) {
+      if (options.isVoice) {
+        return "Welcome to CredaFI! To get started, please type a 4-digit PIN to secure your account (voice notes can't be used to set your PIN).";
+      }
+
       const { data: newUser, error: createUserError } = await supabase
         .from("users")
         .insert({
@@ -338,6 +416,10 @@ async function handleIncomingMessage(from, incomingMessage) {
     }
 
     const state = user.conversation_state || "";
+
+    if (options.isVoice && isPinState(state)) {
+      return "For security, please type your 4-digit PIN instead of sending a voice note.";
+    }
 
     if (
       incomingMessage.toLowerCase() === "menu" &&
@@ -1274,23 +1356,57 @@ async function handleIncomingMessage(from, incomingMessage) {
 }
 
 // ---------------------------------------------------------------------
-// WHATSAPP WEBHOOK
+// WHATSAPP WEBHOOK — now handles text, voice notes, and images
 // ---------------------------------------------------------------------
 app.post("/api/whatsapp", async (req, res) => {
-  const incomingMessage = (req.body.Body || "").trim();
   const from = req.body.From;
-
-  const replyText = await handleIncomingMessage(from, incomingMessage);
+  const numMedia = parseInt(req.body.NumMedia || "0", 10);
 
   const twiml = new twilio.twiml.MessagingResponse();
-  twiml.message(replyText);
+  let replyText = "";
 
+  try {
+    if (numMedia > 0) {
+      const mediaUrl = req.body.MediaUrl0;
+      const contentType = req.body.MediaContentType0 || "";
+
+      console.log("WHATSAPP MEDIA RECEIVED:", { contentType, mediaUrl });
+
+      if (contentType.startsWith("audio")) {
+        const buffer = await downloadTwilioMedia(mediaUrl);
+        const transcribedText = await transcribeAudioBuffer(buffer, "voice.ogg");
+        console.log("WHATSAPP VOICE TRANSCRIBED:", transcribedText);
+        replyText = await handleIncomingMessage(from, transcribedText, {
+          isVoice: true,
+        });
+      } else if (contentType.startsWith("image")) {
+        const buffer = await downloadTwilioMedia(mediaUrl);
+        const description = await analyzeImageBuffer(buffer, contentType);
+        replyText = `Here's what I found in that image:\n\n${description}`;
+      } else {
+        replyText =
+          "I can understand text, voice notes, and images right now.";
+      }
+    } else {
+      const incomingMessage = (req.body.Body || "").trim();
+      replyText = await handleIncomingMessage(from, incomingMessage);
+    }
+  } catch (err) {
+    console.log(
+      "WHATSAPP MEDIA ERROR:",
+      err.response ? err.response.data : err.message
+    );
+    replyText =
+      "Sorry, I couldn't process that. Please try again, or type your message instead.";
+  }
+
+  twiml.message(replyText);
   res.set("Content-Type", "text/xml");
   return res.send(twiml.toString());
 });
 
 // ---------------------------------------------------------------------
-// TELEGRAM WEBHOOK
+// TELEGRAM WEBHOOK — now handles text, voice notes, and photos
 // ---------------------------------------------------------------------
 app.post("/api/telegram/webhook", async (req, res) => {
   try {
@@ -1304,24 +1420,34 @@ app.post("/api/telegram/webhook", async (req, res) => {
 
     const chatId = update.message.chat.id;
     const from = `telegram:${chatId}`;
+    let replyText = "";
 
-    if (!update.message.text) {
+    if (update.message.voice) {
+      const buffer = await downloadTelegramFile(update.message.voice.file_id);
+      const transcribedText = await transcribeAudioBuffer(buffer, "voice.ogg");
+      console.log("TELEGRAM VOICE TRANSCRIBED:", transcribedText);
+      replyText = await handleIncomingMessage(from, transcribedText, {
+        isVoice: true,
+      });
+    } else if (update.message.photo && update.message.photo.length > 0) {
+      const largestPhoto =
+        update.message.photo[update.message.photo.length - 1];
+      const buffer = await downloadTelegramFile(largestPhoto.file_id);
+      const description = await analyzeImageBuffer(buffer, "image/jpeg");
+      replyText = `Here's what I found in that image:\n\n${description}`;
+    } else if (update.message.text) {
+      const incomingMessage = update.message.text.trim();
+
+      console.log("TELEGRAM MESSAGE:", { chatId, incomingMessage });
+
+      replyText = await handleIncomingMessage(from, incomingMessage);
+    } else {
       await sendMessage(
         from,
-        "For now, please send a text message. Voice and image support will be added next."
+        "I can understand text, voice notes, and images right now."
       );
-
       return res.sendStatus(200);
     }
-
-    const incomingMessage = update.message.text.trim();
-
-    console.log("TELEGRAM MESSAGE:", {
-      chatId,
-      incomingMessage,
-    });
-
-    const replyText = await handleIncomingMessage(from, incomingMessage);
 
     await sendMessage(from, replyText);
 
@@ -1338,7 +1464,6 @@ app.post("/api/telegram/webhook", async (req, res) => {
 
 // ---------------------------------------------------------------------
 // TELEGRAM TOKEN TEST ROUTE
-// Open: https://credafi-whatsapp-bot.onrender.com/api/telegram/test
 // ---------------------------------------------------------------------
 app.get("/api/telegram/test", async (req, res) => {
   try {
