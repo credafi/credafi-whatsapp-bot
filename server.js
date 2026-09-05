@@ -180,7 +180,13 @@ app.post("/api/whatsapp", async (req, res) => {
         }
       }
     } catch (mediaErr) {
-      console.log("MEDIA PROCESSING ERROR:", mediaErr.response ? mediaErr.response.data : mediaErr.message);
+      let errorDetail = mediaErr.message;
+      if (mediaErr.response && mediaErr.response.data) {
+        errorDetail = Buffer.isBuffer(mediaErr.response.data)
+          ? mediaErr.response.data.toString("utf8")
+          : mediaErr.response.data;
+      }
+      console.log("MEDIA PROCESSING ERROR:", errorDetail);
       twiml.message("Sorry, I couldn't process that voice note or image. Please try again, or type your message instead.");
       res.set("Content-Type", "text/xml");
       return res.send(twiml.toString());
