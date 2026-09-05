@@ -1391,11 +1391,19 @@ app.post("/api/whatsapp", async (req, res) => {
       const incomingMessage = (req.body.Body || "").trim();
       replyText = await handleIncomingMessage(from, incomingMessage);
     }
-  } catch (err) {
-    console.log(
-      "WHATSAPP MEDIA ERROR:",
-      err.response ? err.response.data : err.message
-    );
+    } catch (err) {
+    let errorDetail = err.message;
+
+    if (err.response) {
+      errorDetail = `status ${err.response.status}: `;
+      if (Buffer.isBuffer(err.response.data)) {
+        errorDetail += err.response.data.toString("utf-8");
+      } else {
+        errorDetail += JSON.stringify(err.response.data);
+      }
+    }
+
+    console.log("WHATSAPP MEDIA ERROR:", errorDetail);
     replyText =
       "Sorry, I couldn't process that. Please try again, or type your message instead.";
   }
