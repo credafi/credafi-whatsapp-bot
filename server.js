@@ -17,8 +17,7 @@ const MENU_TEXT =
   "8. Verify identity\n9. Help";
 
 // ---------------------------------------------------------------------
-// PAYSTACK WEBHOOK — registered before express.urlencoded so we get the
-// raw body needed to verify the signature.
+// PAYSTACK WEBHOOK (payments in)
 // ---------------------------------------------------------------------
 app.post("/api/paystack/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   try {
@@ -94,8 +93,6 @@ async function setState(identifier, state) {
   await supabase.from("users").update({ conversation_state: state }).eq("whatsapp_number", identifier);
 }
 
-// Sends a message to a user regardless of which channel they came from —
-// WhatsApp users are stored as "whatsapp:+234...", Telegram users as "telegram:<chat_id>".
 async function sendMessage(identifier, text) {
   if (identifier.startsWith("whatsapp:")) {
     await twilioClient.messages.create({
@@ -114,11 +111,41 @@ async function sendMessage(identifier, text) {
   }
 }
 
+async function getBankListText() {
+  const banksResp = await axios.get("https://api.paystack.co/bank", {
+    headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+  });
+  return banksResp.data.data.slice(0, 15).map(b => `${b.code} - ${b.name}`).join("\n");
+}
+
+async function resolveBankAccount(accountNumber, bankCode) {
+  const resolveResp = await axios.get(
+    `https://api.paystack.co/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+    { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+  );
+  return resolveResp.data.data.account_name;
+}
+
+async function createTransferRecipient(accountName, accountNumber, bankCode) {
+  const resp = await axios.post(
+    "https://api.paystack.co/transferrecipient",
+    { type: "nuban", name: accountName, account_number: accountNumber, bank_code: bankCode, currency: "NGN" },
+    { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+  );
+  return resp.data.data.recipient_code;
+}
+
+async function initiatePaystackTransfer(recipientCode, amountKobo, reason, reference) {
+  const resp = await axios.post(
+    "https://api.paystack.co/transfer",
+    { source: "balance", amount: amountKobo, recipient: recipientCode, reason, reference },
+    { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+  );
+  return resp.data.data;
+}
+
 // ---------------------------------------------------------------------
-// CORE MESSAGE HANDLER — shared by WhatsApp and Telegram.
-// Takes a channel-prefixed identifier ("whatsapp:+234..." or
-// "telegram:123456789") and the raw text sent, returns the reply text.
-// All business logic lives here exactly once, regardless of channel.
+// CORE MESSAGE HANDLER — shared by WhatsApp and Telegram
 // ---------------------------------------------------------------------
 async function handleIncomingMessage(from, incomingMessage) {
   let replyText = "";
@@ -136,7 +163,7 @@ async function handleIncomingMessage(from, incomingMessage) {
         .from("users").insert({ whatsapp_number: from, conversation_state: "awaiting_pin_setup" }).select().single();
       await getOrCreateWallet(from);
       user = newUser;
-      return "Welcome to CredAfri! To get started, please set a 4-digit PIN to secure your account. Reply with 4 digits (e.g. 1234).";
+      return "Welcome to CredaFI! To get started, please set a 4-digit PIN to secure your account. Reply with 4 digits (e.g. 1234).";
     }
 
     const state = user.conversation_state || "";
@@ -183,13 +210,16 @@ async function handleIncomingMessage(from, incomingMessage) {
         replyText = "How much would you like to fund your wallet with? Reply with an amount in Naira (e.g. 1000).";
 
       } else if (incomingMessage === "3") {
-        const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from).limit(5);
-        let msg = "Who are you sending to? Reply with their WhatsApp number (e.g. 2348012345678).";
+        const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from).limit(8);
+        let msg = "Who are you sending to?\n";
         if (beneficiaries && beneficiaries.length > 0) {
-          msg += "\n\nOr reply with a saved beneficiary number:\n" +
-            beneficiaries.map((b, i) => `${i + 1}. ${b.nickname || b.beneficiary_number}`).join("\n");
+          msg += beneficiaries.map((b, i) =>
+            `${i + 1}. ${b.nickname} (${b.type === "bank" ? b.account_name : "CredaFI user"})`
+          ).join("\n") + "\n\n";
+          msg += "Reply with a number above, or:\n";
         }
-        await setState(from, "awaiting_send_recipient");
+        msg += "Reply 'bank' to send to a new bank account, or 'user' to send to a new CredaFI user.";
+        await setState(from, "awaiting_send_recipient_choice");
         replyText = msg;
 
       } else if (incomingMessage === "4") {
@@ -198,7 +228,9 @@ async function handleIncomingMessage(from, incomingMessage) {
         if (!beneficiaries || beneficiaries.length === 0) {
           msg += "(none saved yet)\n";
         } else {
-          msg += beneficiaries.map((b, i) => `${i + 1}. ${b.nickname || ""} ${b.beneficiary_number}`).join("\n") + "\n";
+          msg += beneficiaries.map((b, i) =>
+            `${i + 1}. ${b.nickname} — ${b.type === "bank" ? `${b.account_name} (${b.account_number})` : "CredaFI user"}`
+          ).join("\n") + "\n";
         }
         msg += "\nReply 'add' to save a new beneficiary, or 'menu' to go back.";
         await setState(from, "beneficiaries_menu");
@@ -256,8 +288,8 @@ async function handleIncomingMessage(from, incomingMessage) {
     // ---------------- BENEFICIARIES ----------------
     } else if (state === "beneficiaries_menu") {
       if (incomingMessage.toLowerCase() === "add") {
-        await setState(from, "awaiting_beneficiary_number");
-        replyText = "Reply with the WhatsApp number to save (e.g. 2348012345678).";
+        await setState(from, "awaiting_beneficiary_type");
+        replyText = "Reply 'bank' to save a bank account, or 'user' to save another CredaFI user.";
       } else if (incomingMessage.toLowerCase() === "menu") {
         await setState(from, "main_menu");
         replyText = MENU_TEXT;
@@ -265,51 +297,159 @@ async function handleIncomingMessage(from, incomingMessage) {
         replyText = "Reply 'add' to save a new beneficiary, or 'menu' to go back.";
       }
 
+    } else if (state === "awaiting_beneficiary_type") {
+      if (incomingMessage.toLowerCase() === "bank") {
+        await setState(from, "awaiting_beneficiary_bank_code");
+        replyText = "Reply with the bank code (e.g. 058 for GTBank, 044 for Access Bank). Reply 'banks' for the full list.";
+      } else if (incomingMessage.toLowerCase() === "user") {
+        await setState(from, "awaiting_beneficiary_number");
+        replyText = "Reply with their WhatsApp number (e.g. 2348012345678), or their Telegram ID prefixed with 'tg' (e.g. tg123456789).";
+      } else {
+        replyText = "Please reply 'bank' or 'user'.";
+      }
+
+    } else if (state === "awaiting_beneficiary_bank_code") {
+      if (incomingMessage.toLowerCase() === "banks") {
+        try {
+          replyText = `Common bank codes:\n${await getBankListText()}\n\n(Reply with a code when ready)`;
+        } catch (err) {
+          replyText = "Couldn't fetch the bank list right now. Please reply with your bank code directly.";
+        }
+      } else {
+        await setState(from, `awaiting_beneficiary_account_number:${incomingMessage.trim()}`);
+        replyText = "Now reply with the 10-digit account number.";
+      }
+
+    } else if (state.startsWith("awaiting_beneficiary_account_number:")) {
+      const bankCode = state.split(":")[1];
+      const accountNumber = incomingMessage.replace(/\D/g, "");
+      try {
+        const accountName = await resolveBankAccount(accountNumber, bankCode);
+        await setState(from, `awaiting_beneficiary_bank_nickname:${bankCode}:${accountNumber}:${accountName}`);
+        replyText = `Account name: ${accountName}. What nickname should we save this as? (e.g. Mum, Landlord)`;
+      } catch (err) {
+        console.log("BENEFICIARY BANK RESOLVE ERROR:", err.response ? err.response.data : err.message);
+        await setState(from, "main_menu");
+        replyText = "Couldn't verify that account. Double check the bank code and account number, then try again from the beneficiaries menu.";
+      }
+
+    } else if (state.startsWith("awaiting_beneficiary_bank_nickname:")) {
+      const [, bankCode, accountNumber, ...nameParts] = state.split(":");
+      const accountName = nameParts.join(":");
+      await supabase.from("beneficiaries").insert({
+        owner_whatsapp_number: from,
+        type: "bank",
+        bank_code: bankCode,
+        account_number: accountNumber,
+        account_name: accountName,
+        nickname: incomingMessage,
+      });
+      await setState(from, "main_menu");
+      replyText = "Saved! Reply 'menu' to continue.";
+
     } else if (state === "awaiting_beneficiary_number") {
-      const beneficiaryNumber = `whatsapp:+${incomingMessage.replace(/\D/g, "")}`;
-      await setState(from, `awaiting_beneficiary_nickname:${beneficiaryNumber}`);
-      replyText = "What nickname should we save this as? (e.g. Mum, Landlord)";
+      let identifier;
+      if (incomingMessage.toLowerCase().startsWith("tg")) {
+        identifier = `telegram:${incomingMessage.replace(/\D/g, "")}`;
+      } else {
+        identifier = `whatsapp:+${incomingMessage.replace(/\D/g, "")}`;
+      }
+      const { data: existingUser } = await supabase.from("users").select("whatsapp_number").eq("whatsapp_number", identifier).single();
+      if (!existingUser) {
+        replyText = "That user isn't registered on CredaFI yet. Reply with a different WhatsApp number/Telegram ID, or 'menu' to cancel.";
+      } else {
+        await setState(from, `awaiting_beneficiary_nickname:${identifier}`);
+        replyText = "What nickname should we save this as? (e.g. Mum, Landlord)";
+      }
 
     } else if (state.startsWith("awaiting_beneficiary_nickname:")) {
-      const beneficiaryNumber = state.split(":").slice(1).join(":");
+      const identifier = state.split(":").slice(1).join(":");
       await supabase.from("beneficiaries").insert({
-        owner_whatsapp_number: from, beneficiary_number: beneficiaryNumber, nickname: incomingMessage,
+        owner_whatsapp_number: from, type: "internal", beneficiary_number: identifier, nickname: incomingMessage,
       });
       await setState(from, "main_menu");
       replyText = "Saved! Reply 'menu' to continue.";
 
     // ---------------- SEND MONEY ----------------
-    } else if (state === "awaiting_send_recipient") {
-      const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from);
+    } else if (state === "awaiting_send_recipient_choice") {
+      const { data: beneficiaries } = await supabase.from("beneficiaries").select("*").eq("owner_whatsapp_number", from).limit(8);
       const selectionIndex = parseInt(incomingMessage, 10);
-      let recipientNumber;
 
       if (
         beneficiaries && beneficiaries.length > 0 &&
         /^\d{1,2}$/.test(incomingMessage) &&
         selectionIndex >= 1 && selectionIndex <= beneficiaries.length
       ) {
-        recipientNumber = beneficiaries[selectionIndex - 1].beneficiary_number;
+        const chosen = beneficiaries[selectionIndex - 1];
+        if (chosen.type === "bank") {
+          await setState(from, `awaiting_send_amount:bank:saved:${chosen.id}`);
+        } else {
+          await setState(from, `awaiting_send_amount:internal:${chosen.beneficiary_number}`);
+        }
+        replyText = `Sending to ${chosen.nickname}. How much would you like to send? Reply with an amount in Naira (e.g. 500).`;
+
+      } else if (incomingMessage.toLowerCase() === "bank") {
+        await setState(from, "awaiting_send_bank_code");
+        replyText = "Reply with the bank code (e.g. 058 for GTBank, 044 for Access Bank). Reply 'banks' for the full list.";
+
+      } else if (incomingMessage.toLowerCase() === "user") {
+        await setState(from, "awaiting_send_user_identifier");
+        replyText = "Reply with their WhatsApp number (e.g. 2348012345678), or their Telegram ID prefixed with 'tg' (e.g. tg123456789).";
+
       } else {
-        const digitsOnly = incomingMessage.replace(/\D/g, "");
-        recipientNumber = `whatsapp:+${digitsOnly}`;
+        replyText = "Please reply with a number from the list, or 'bank'/'user'.";
       }
 
-      if (recipientNumber === from) {
-        replyText = "You can't send money to yourself. Reply with a different number, or 'menu' to cancel.";
+    } else if (state === "awaiting_send_bank_code") {
+      if (incomingMessage.toLowerCase() === "banks") {
+        try {
+          replyText = `Common bank codes:\n${await getBankListText()}\n\n(Reply with a code when ready)`;
+        } catch (err) {
+          replyText = "Couldn't fetch the bank list right now. Please reply with your bank code directly.";
+        }
       } else {
-        const { data: recipient } = await supabase.from("users").select("whatsapp_number").eq("whatsapp_number", recipientNumber).single();
+        await setState(from, `awaiting_send_account_number:${incomingMessage.trim()}`);
+        replyText = "Now reply with the 10-digit account number.";
+      }
+
+    } else if (state.startsWith("awaiting_send_account_number:")) {
+      const bankCode = state.split(":")[1];
+      const accountNumber = incomingMessage.replace(/\D/g, "");
+      try {
+        const accountName = await resolveBankAccount(accountNumber, bankCode);
+        await setState(from, `awaiting_send_amount:bank:new:${bankCode}:${accountNumber}:${accountName}`);
+        replyText = `Account name: ${accountName}. How much would you like to send? Reply with an amount in Naira (e.g. 500).`;
+      } catch (err) {
+        console.log("SEND BANK RESOLVE ERROR:", err.response ? err.response.data : err.message);
+        await setState(from, "main_menu");
+        replyText = "Couldn't verify that account. Double check the bank code and account number, then try again from the menu.";
+      }
+
+    } else if (state === "awaiting_send_user_identifier") {
+      let identifier;
+      if (incomingMessage.toLowerCase().startsWith("tg")) {
+        identifier = `telegram:${incomingMessage.replace(/\D/g, "")}`;
+      } else {
+        identifier = `whatsapp:+${incomingMessage.replace(/\D/g, "")}`;
+      }
+      if (identifier === from) {
+        replyText = "You can't send money to yourself. Reply with a different identifier, or 'menu' to cancel.";
+      } else {
+        const { data: recipient } = await supabase.from("users").select("whatsapp_number").eq("whatsapp_number", identifier).single();
         if (!recipient) {
-          replyText = "That number isn't a registered CredAfri user yet. Reply with a different number, or 'menu' to cancel.";
+          replyText = "That user isn't registered on CredaFI yet. Reply with a different WhatsApp number/Telegram ID, or 'menu' to cancel.";
         } else {
-          await setState(from, `awaiting_send_amount:${recipientNumber}`);
+          await setState(from, `awaiting_send_amount:internal:${identifier}`);
           replyText = "How much would you like to send? Reply with an amount in Naira (e.g. 500).";
         }
       }
 
+    // Amount entry — shared by all three recipient types (saved bank, new bank, internal)
     } else if (state.startsWith("awaiting_send_amount:")) {
-      const recipientNumber = state.split(":").slice(1).join(":");
+      const parts = state.split(":");
+      const kind = parts[1]; // "bank" or "internal"
       const amountNaira = parseFloat(incomingMessage);
+
       if (isNaN(amountNaira) || amountNaira <= 0) {
         replyText = "That doesn't look like a valid amount. Reply with a number, e.g. 500.";
       } else {
@@ -319,14 +459,15 @@ async function handleIncomingMessage(from, incomingMessage) {
           replyText = `Insufficient balance. Current balance: N${(senderWallet.balance_kobo / 100).toFixed(2)}. Reply 'menu' to go back.`;
           await setState(from, "main_menu");
         } else {
-          await setState(from, `awaiting_send_pin:${recipientNumber}:${amountKobo}`);
+          await setState(from, `awaiting_send_pin:${parts.slice(1).join(":")}:${amountKobo}`);
           replyText = `Enter your 4-digit PIN to confirm sending N${amountNaira.toFixed(2)}.`;
         }
       }
 
+    // PIN confirmation — executes the actual transfer
     } else if (state.startsWith("awaiting_send_pin:")) {
-      const [, recipientNumber, amountKoboStr] = state.split(":");
-      const amountKobo = parseInt(amountKoboStr, 10);
+      const parts = state.split(":");
+      const kind = parts[1]; // "bank" or "internal"
       const pinMatches = user.pin_hash && (await bcrypt.compare(incomingMessage, user.pin_hash));
 
       if (!pinMatches) {
@@ -334,19 +475,89 @@ async function handleIncomingMessage(from, incomingMessage) {
         replyText = "Incorrect PIN. Transfer cancelled. Reply 'menu' to try again.";
       } else {
         const senderWallet = await getOrCreateWallet(from);
-        if (senderWallet.balance_kobo < amountKobo) {
-          replyText = "Insufficient balance. Transfer cancelled.";
-        } else {
-          const recipientWallet = await getOrCreateWallet(recipientNumber);
-          await supabase.from("wallets").update({ balance_kobo: senderWallet.balance_kobo - amountKobo }).eq("whatsapp_number", from);
-          await supabase.from("wallets").update({ balance_kobo: recipientWallet.balance_kobo + amountKobo }).eq("whatsapp_number", recipientNumber);
-          await logTransaction(from, "send", amountKobo, recipientNumber, null);
-          await logTransaction(recipientNumber, "receive", amountKobo, from, null);
 
-          replyText = `N${(amountKobo / 100).toFixed(2)} sent successfully!`;
-          await sendMessage(recipientNumber, `You've received N${(amountKobo / 100).toFixed(2)} on CredAfri!`);
+        if (kind === "internal") {
+          // parts: ["internal", identifier..., amountKobo] — identifier may itself contain ":" (e.g. telegram:123)
+          const amountKobo = parseInt(parts[parts.length - 1], 10);
+          const recipientNumber = parts.slice(2, parts.length - 1).join(":");
+
+          if (senderWallet.balance_kobo < amountKobo) {
+            replyText = "Insufficient balance. Transfer cancelled.";
+          } else {
+            const recipientWallet = await getOrCreateWallet(recipientNumber);
+            await supabase.from("wallets").update({ balance_kobo: senderWallet.balance_kobo - amountKobo }).eq("whatsapp_number", from);
+            await supabase.from("wallets").update({ balance_kobo: recipientWallet.balance_kobo + amountKobo }).eq("whatsapp_number", recipientNumber);
+            await logTransaction(from, "send", amountKobo, recipientNumber, null);
+            await logTransaction(recipientNumber, "receive", amountKobo, from, null);
+
+            replyText = `N${(amountKobo / 100).toFixed(2)} sent successfully!`;
+            await sendMessage(recipientNumber, `You've received N${(amountKobo / 100).toFixed(2)} on CredaFI!`);
+          }
+          await setState(from, "main_menu");
+
+        } else if (kind === "bank") {
+          const source = parts[2]; // "saved" or "new"
+          const amountKobo = parseInt(parts[parts.length - 1], 10);
+
+          if (senderWallet.balance_kobo < amountKobo) {
+            replyText = "Insufficient balance. Transfer cancelled.";
+            await setState(from, "main_menu");
+          } else {
+            try {
+              let recipientCode, accountName, bankCode, accountNumber, beneficiaryId = null;
+
+              if (source === "saved") {
+                beneficiaryId = parts[3];
+                const { data: beneficiary } = await supabase.from("beneficiaries").select("*").eq("id", beneficiaryId).single();
+                bankCode = beneficiary.bank_code;
+                accountNumber = beneficiary.account_number;
+                accountName = beneficiary.account_name;
+                recipientCode = beneficiary.paystack_recipient_code;
+
+                if (!recipientCode) {
+                  recipientCode = await createTransferRecipient(accountName, accountNumber, bankCode);
+                  await supabase.from("beneficiaries").update({ paystack_recipient_code: recipientCode }).eq("id", beneficiaryId);
+                }
+              } else {
+                // "new": parts = ["bank","new",bankCode,accountNumber,...accountNameParts,amountKobo]
+                bankCode = parts[3];
+                accountNumber = parts[4];
+                accountName = parts.slice(5, parts.length - 1).join(":");
+                recipientCode = await createTransferRecipient(accountName, accountNumber, bankCode);
+              }
+
+              const reference = `credafi_transfer_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+              const transferResult = await initiatePaystackTransfer(recipientCode, amountKobo, "CredaFI transfer", reference);
+
+              await supabase.from("wallets").update({ balance_kobo: senderWallet.balance_kobo - amountKobo }).eq("whatsapp_number", from);
+              await logTransaction(from, "send", amountKobo, accountName, reference);
+
+              replyText = `N${(amountKobo / 100).toFixed(2)} sent to ${accountName}! Status: ${transferResult.status}.`;
+
+              if (source === "new") {
+                await setState(from, `awaiting_save_beneficiary:${bankCode}:${accountNumber}:${accountName}`);
+                replyText += "\n\nSave this account as a beneficiary for next time? Reply 'yes' or 'menu' to finish.";
+              } else {
+                await setState(from, "main_menu");
+              }
+            } catch (err) {
+              console.log("TRANSFER ERROR:", err.response ? err.response.data : err.message);
+              await setState(from, "main_menu");
+              replyText = "Something went wrong sending this transfer. Please try again shortly, or reply 'menu'.";
+            }
+          }
         }
+      }
+
+    } else if (state.startsWith("awaiting_save_beneficiary:")) {
+      if (incomingMessage.toLowerCase() === "yes") {
+        const [, bankCode, accountNumber, ...nameParts] = state.split(":");
+        const accountName = nameParts.join(":");
+        await setState(from, `awaiting_beneficiary_bank_nickname:${bankCode}:${accountNumber}:${accountName}`);
+        replyText = "What nickname should we save this as? (e.g. Mum, Landlord)";
+      } else {
         await setState(from, "main_menu");
+        replyText = "Okay! Reply 'menu' to continue.";
       }
 
     // ---------------- FUND WALLET ----------------
@@ -377,15 +588,11 @@ async function handleIncomingMessage(from, incomingMessage) {
         await setState(from, "main_menu");
       }
 
-    // ---------------- VERIFY BANK ACCOUNT ----------------
+    // ---------------- VERIFY BANK ACCOUNT (user's own account) ----------------
     } else if (state === "awaiting_bank_code") {
       if (incomingMessage.toLowerCase() === "banks") {
         try {
-          const banksResp = await axios.get("https://api.paystack.co/bank", {
-            headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
-          });
-          const list = banksResp.data.data.slice(0, 15).map(b => `${b.code} - ${b.name}`).join("\n");
-          replyText = `Common bank codes:\n${list}\n\n(Reply with a code when ready)`;
+          replyText = `Common bank codes:\n${await getBankListText()}\n\n(Reply with a code when ready)`;
         } catch (err) {
           replyText = "Couldn't fetch the bank list right now. Please reply with your bank code directly.";
         }
@@ -398,11 +605,7 @@ async function handleIncomingMessage(from, incomingMessage) {
       const bankCode = state.split(":")[1];
       const accountNumber = incomingMessage.replace(/\D/g, "");
       try {
-        const resolveResp = await axios.get(
-          `https://api.paystack.co/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
-          { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
-        );
-        const accountName = resolveResp.data.data.account_name;
+        const accountName = await resolveBankAccount(accountNumber, bankCode);
         await supabase.from("users").update({
           bank_account_number: accountNumber, bank_code: bankCode, account_name: accountName,
         }).eq("whatsapp_number", from);
@@ -414,7 +617,7 @@ async function handleIncomingMessage(from, incomingMessage) {
         replyText = "Couldn't verify that account. Double check the bank code and account number, then try again from the menu.";
       }
 
-    // ---------------- VERIFY IDENTITY (name, then BVN, then NIN via QoreID) ----------------
+    // ---------------- VERIFY IDENTITY ----------------
     } else if (state === "awaiting_full_name_for_identity") {
       const fullName = incomingMessage.trim();
       if (fullName.split(" ").length < 2) {
@@ -513,7 +716,7 @@ async function handleIncomingMessage(from, incomingMessage) {
 }
 
 // ---------------------------------------------------------------------
-// WHATSAPP ROUTE — thin wrapper around the shared handler
+// WHATSAPP ROUTE
 // ---------------------------------------------------------------------
 app.post("/api/whatsapp", async (req, res) => {
   const incomingMessage = (req.body.Body || "").trim();
@@ -528,7 +731,7 @@ app.post("/api/whatsapp", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// TELEGRAM ROUTE — thin wrapper around the same shared handler
+// TELEGRAM ROUTE
 // ---------------------------------------------------------------------
 app.post("/api/telegram/webhook", express.json(), async (req, res) => {
   try {
