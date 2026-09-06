@@ -29,7 +29,9 @@ const MENU_TEXT =
   "5. Transaction history\n" +
   "6. Account details\n" +
   "7. Verify bank account\n" +
-  "8. Verify identity\n9. Help\n10. Create invoice"; +
+  "8. Verify identity\n" +
+  "9. Help\n" +
+  "10. Create invoice";
 
 // ---------------------------------------------------------------------
 // PAYSTACK WEBHOOK
@@ -985,7 +987,7 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
   replyText =
     "Create invoice\n\n" +
     "What is the customer's name?\n" +
-    "Reply 'menu' anytime to cancel."; else if (incomingMessage === "9") {
+    "Reply 'menu' anytime to cancel.";
         replyText =
           "Help:\n" +
           "1. Check balance\n" +
