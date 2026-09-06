@@ -978,36 +978,41 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
           await setState(from, "awaiting_bvn");
           replyText = `Verifying as ${user.full_name}. Reply with your 11-digit BVN.`;
         }
-      } else if (
-  incomingMessage === "invoice" ||
-  incomingMessage === "10"
+      } else if (incomingMessage === "9") {
+  replyText =
+    "Help:\n" +
+    "1. Check balance\n" +
+    "2. Fund wallet\n" +
+    "3. Send money\n" +
+    "4. Beneficiaries\n" +
+    "5. Transaction history\n" +
+    "6. Account details\n" +
+    "7. Verify bank account\n" +
+    "8. Verify identity\n" +
+    "9. Help\n" +
+    "10. Create invoice\n\n" +
+    "Reply 'menu' at any time to return here.";
+
+} else if (
+  incomingMessage === "10" ||
+  incomingMessage.toLowerCase() === "invoice"
 ) {
+  await supabase.from("invoice_drafts").upsert({
+    user_identifier: from,
+    customer_name: null,
+    customer_phone: null,
+    amount_kobo: null,
+    description: null,
+    updated_at: new Date().toISOString(),
+  });
+
   await setState(from, "awaiting_invoice_customer_name");
 
-  replyText =
-    "Create invoice\n\n" +
-    "What is the customer's name?\n" +
-    "Reply 'menu' anytime to cancel.";
-        replyText =
-          "Help:\n" +
-          "1. Check balance\n" +
-          "2. Fund wallet\n" +
-          "3. Send money\n" +
-          "4. Beneficiaries\n" +
-          "5. Transaction history\n" +
-          "6. Account details\n" +
-          "7. Verify bank account\n" +
-          "8. Verify identity\n\n" +
-          "Reply 'menu' at any time to return here. Reply 'invoice' to create a customer invoice.";
-      } else if (incomingMessage.toLowerCase() === "invoice") {
-        await setState(from, "awaiting_invoice_details");
-        replyText =
-          "Let's create an invoice. Reply in this exact format:\n" +
-          "Customer name | Customer WhatsApp number | Amount in Naira | Description\n\n" +
-          "Example:\nAda Okafor | 2348012345678 | 5000 | Payment for hair styling";
-      } else {
-        replyText = "Sorry, I did not understand that. Reply 'menu' for options.";
-      }
+  replyText = "Create invoice\n\nWhat is the customer's name?";
+
+} else {
+  replyText = "Sorry, I did not understand that. Reply 'menu' to see your options.";
+}
 
       // ---------------- INVOICING ----------------
     } else if (state === "awaiting_invoice_details") {
