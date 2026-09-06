@@ -34,7 +34,6 @@ const MENU_TEXT =
 
 // ---------------------------------------------------------------------
 // PAYSTACK WEBHOOK
-// Must appear BEFORE express.json() and express.urlencoded()
 // ---------------------------------------------------------------------
 app.post(
   "/api/paystack/webhook",
@@ -368,9 +367,25 @@ async function initiatePaystackTransfer(
   return resp.data.data;
 }
 
+async function getQoreIdAccessToken() {
+  const tokenResp = await axios.post(
+    "https://api.qoreid.com/token",
+    {
+      clientId: process.env.QOREID_CLIENT_ID,
+      secret: process.env.QOREID_CLIENT_SECRET,
+    },
+    { headers: { "Content-Type": "application/json" } }
+  );
+
+  if (!tokenResp.data.accessToken) {
+    throw new Error("QoreID did not return an access token.");
+  }
+
+  return tokenResp.data.accessToken;
+}
+
 // ---------------------------------------------------------------------
 // CORE MESSAGE HANDLER
-// Shared by WhatsApp and Telegram — options.isVoice blocks PIN entry
 // ---------------------------------------------------------------------
 async function handleIncomingMessage(from, incomingMessage, options = {}) {
   let replyText = "";
@@ -1195,75 +1210,92 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
 
         replyText = `Thanks, ${fullName}. Now reply with your 11-digit BVN.`;
       }
+
+      // ---------------- BVN — consent-based iGree flow ----------------
     } else if (state === "awaiting_bvn") {
       const bvn = incomingMessage.replace(/\D/g, "");
 
       if (bvn.length !== 11) {
         replyText = "BVN must be exactly 11 digits. Please try again.";
       } else {
-        const [firstname, ...rest] = user.full_name.split(" ");
-        const lastname = rest.join(" ");
-
         try {
-          const tokenResp = await axios.post(
-            "https://api.qoreid.com/token",
-            {
-              clientId: process.env.QOREID_CLIENT_ID,
-              secret: process.env.QOREID_CLIENT_SECRET,
-            },
-            {
-              headers: {
-                "Content-Type": "application/json",
-              },
-            }
+          const accessToken = await getQoreIdAccessToken();
+
+          const consentResp = await axios.post(
+            `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
+            {},
+            { headers: { Authorization: `Bearer ${accessToken}` } }
           );
 
-          const accessToken = tokenResp.data.accessToken;
+          console.log("BVN CONSENT INITIATED:", consentResp.data);
 
-          if (!accessToken) {
-            throw new Error("QoreID did not return an access token.");
-          }
+          await setState(from, `awaiting_bvn_consent:${bvn}`);
 
-          const verifyResp = await axios.post(
-            `https://api.qoreid.com/v1/ng/identities/bvn-basic/${bvn}`,
-            {
-              firstname,
-              lastname,
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                "Content-Type": "application/json",
-              },
-            }
+          replyText =
+            "To verify your BVN, please open this secure link and follow the steps (you'll confirm with an OTP sent to your BVN-linked phone number):\n\n" +
+            `${consentResp.data.consentUrl}\n\n` +
+            "Once you've completed it, reply 'done' here. If the link stops working, reply 'resend' for a fresh one.";
+        } catch (err) {
+          console.log(
+            "BVN CONSENT ERROR:",
+            err.response ? err.response.data : err.message
           );
 
-          const matched =
-            verifyResp.data.summary && verifyResp.data.summary.bvn_check
-              ? verifyResp.data.summary.bvn_check.status === "EXACT_MATCH"
-              : true;
+          replyText =
+            "We could not start BVN verification right now. Please try again later or reply 'menu' to cancel.";
+        }
+      }
+    } else if (state.startsWith("awaiting_bvn_consent:")) {
+      const bvn = state.split(":")[1];
 
-          if (!matched) {
-            replyText =
-              "That BVN does not match the name on file. Double-check it and try again.";
-          } else {
+      if (incomingMessage.toLowerCase() === "resend") {
+        try {
+          const accessToken = await getQoreIdAccessToken();
+
+          const consentResp = await axios.post(
+            `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
+            {},
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+          );
+
+          replyText = `Here's a fresh link:\n\n${consentResp.data.consentUrl}\n\nReply 'done' once you've completed it.`;
+        } catch (err) {
+          console.log(
+            "BVN CONSENT RESEND ERROR:",
+            err.response ? err.response.data : err.message
+          );
+          replyText = "Couldn't generate a new link right now. Please try again shortly.";
+        }
+      } else {
+        try {
+          const accessToken = await getQoreIdAccessToken();
+
+          const checkResp = await axios.post(
+            `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
+            {},
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+          );
+
+          console.log("BVN CONSENT CHECK:", checkResp.data);
+
+          if (checkResp.data.consentStatus === true) {
             await supabase
               .from("users")
               .update({ bvn_verified: true })
               .eq("whatsapp_number", from);
 
             await setState(from, "awaiting_nin");
-
             replyText = "BVN verified! Now reply with your 11-digit NIN.";
+          } else {
+            replyText =
+              "It looks like consent hasn't been completed yet. Please open the link, complete the OTP step, then reply 'done' again. Reply 'resend' for a fresh link.";
           }
         } catch (err) {
           console.log(
-            "BVN VERIFY ERROR:",
+            "BVN CONSENT CHECK ERROR:",
             err.response ? err.response.data : err.message
           );
-
-          replyText =
-            "We could not verify that BVN right now. Please try again later or reply 'menu' to cancel.";
+          replyText = "Couldn't check your consent status right now. Please try again shortly.";
         }
       }
     } else if (state === "awaiting_nin") {
@@ -1276,24 +1308,7 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
         const lastname = rest.join(" ");
 
         try {
-          const tokenResp = await axios.post(
-            "https://api.qoreid.com/token",
-            {
-              clientId: process.env.QOREID_CLIENT_ID,
-              secret: process.env.QOREID_CLIENT_SECRET,
-            },
-            {
-              headers: {
-                "Content-Type": "application/json",
-              },
-            }
-          );
-
-          const accessToken = tokenResp.data.accessToken;
-
-          if (!accessToken) {
-            throw new Error("QoreID did not return an access token.");
-          }
+          const accessToken = await getQoreIdAccessToken();
 
           const verifyResp = await axios.post(
             `https://api.qoreid.com/v1/ng/identities/nin/${nin}`,
@@ -1356,7 +1371,7 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
 }
 
 // ---------------------------------------------------------------------
-// WHATSAPP WEBHOOK — now handles text, voice notes, and images
+// WHATSAPP WEBHOOK
 // ---------------------------------------------------------------------
 app.post("/api/whatsapp", async (req, res) => {
   const from = req.body.From;
@@ -1391,7 +1406,7 @@ app.post("/api/whatsapp", async (req, res) => {
       const incomingMessage = (req.body.Body || "").trim();
       replyText = await handleIncomingMessage(from, incomingMessage);
     }
-    } catch (err) {
+  } catch (err) {
     let errorDetail = err.message;
 
     if (err.response) {
@@ -1414,7 +1429,7 @@ app.post("/api/whatsapp", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// TELEGRAM WEBHOOK — now handles text, voice notes, and photos
+// TELEGRAM WEBHOOK
 // ---------------------------------------------------------------------
 app.post("/api/telegram/webhook", async (req, res) => {
   try {
