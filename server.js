@@ -29,8 +29,7 @@ const MENU_TEXT =
   "5. Transaction history\n" +
   "6. Account details\n" +
   "7. Verify bank account\n" +
-  "8. Verify identity\n" +
-  "9. Help";
+  "8. Verify identity\n9. Help\n10. Create invoice"; +
 
 // ---------------------------------------------------------------------
 // PAYSTACK WEBHOOK
@@ -58,6 +57,41 @@ app.post(
       if (event.event === "charge.success") {
         const reference = event.data.reference;
         const amountKobo = event.data.amount;
+        const { data: invoice, error: invoiceLookupError } = await supabase
+  .from("invoices")
+  .select("*")
+  .eq("payment_reference", reference)
+  .maybeSingle();
+
+if (invoice && invoice.status !== "paid") {
+  await supabase
+    .from("invoices")
+    .update({
+      status: "paid",
+      paid_at: new Date().toISOString(),
+    })
+    .eq("id", invoice.id);
+
+  await logSecurityEvent(
+    invoice.business_identifier,
+    "invoice_paid",
+    0,
+    {
+      invoice_number: invoice.invoice_number,
+      payment_reference: reference,
+      amount_kobo: amountKobo,
+    }
+  );
+
+  await sendMessage(
+    invoice.business_identifier,
+    `Invoice paid!\n\nInvoice: ${invoice.invoice_number}\nCustomer: ${invoice.customer_name}\nAmount received: N${(
+      amountKobo / 100
+    ).toFixed(2)}`
+  );
+
+  return res.sendStatus(200);
+}
 
         const { data: pending, error: pendingError } = await supabase
           .from("pending_payments")
@@ -402,6 +436,224 @@ async function initiatePaystackTransfer(
 
   return resp.data.data;
 }
+// ---------------------------------------------------------------------
+// FRAUD / SECURITY HELPERS
+// ---------------------------------------------------------------------
+async function logSecurityEvent(identifier, eventType, riskScore, details = {}) {
+  const { error } = await supabase.from("security_events").insert({
+    user_identifier: identifier,
+    event_type: eventType,
+    risk_score: riskScore,
+    details,
+  });
+
+  if (error) {
+    console.log("SECURITY EVENT ERROR:", error);
+  }
+}
+
+async function getFraudCheck(identifier, amountKobo, recipient) {
+  const { data: user, error: userError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("whatsapp_number", identifier)
+    .single();
+
+  if (userError || !user) {
+    return {
+      allowed: false,
+      score: 100,
+      reason: "User account could not be validated.",
+    };
+  }
+
+  if (user.is_transfer_blocked) {
+    return {
+      allowed: false,
+      score: 100,
+      reason: "Transfers are blocked on this account.",
+    };
+  }
+
+  let riskScore = 0;
+  const reasons = [];
+
+  // Per-transfer limit
+  const perTransferLimit =
+    user.per_transfer_limit_kobo || 2000000; // Default: ₦20,000
+
+  if (amountKobo > perTransferLimit) {
+    riskScore += 70;
+    reasons.push(
+      `Amount is above the per-transfer limit of ₦${(
+        perTransferLimit / 100
+      ).toFixed(2)}`
+    );
+  }
+
+  // Higher risk if BVN/NIN have not yet been verified
+  if (!user.bvn_verified || !user.nin_verified) {
+    riskScore += 25;
+    reasons.push("Identity verification is incomplete");
+  }
+
+  // Transfers made in the past 10 minutes
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+
+  const { data: recentTransactions, error: recentError } = await supabase
+    .from("transactions")
+    .select("id, amount, created_at")
+    .eq("whatsapp_number", identifier)
+    .eq("type", "send")
+    .gte("created_at", tenMinutesAgo);
+
+  if (!recentError && recentTransactions && recentTransactions.length >= 3) {
+    riskScore += 50;
+    reasons.push("More than 3 transfer attempts in 10 minutes");
+  }
+
+  // Daily outgoing transfer total
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const { data: todayTransactions, error: dailyError } = await supabase
+    .from("transactions")
+    .select("amount")
+    .eq("whatsapp_number", identifier)
+    .eq("type", "send")
+    .gte("created_at", todayStart.toISOString());
+
+  const amountSentToday = dailyError
+    ? 0
+    : (todayTransactions || []).reduce(
+        (sum, transaction) => sum + Number(transaction.amount || 0),
+        0
+      );
+
+  const dailyLimit =
+    user.daily_transfer_limit_kobo || 5000000; // Default: ₦50,000
+
+  if (amountSentToday + amountKobo > dailyLimit) {
+    riskScore += 80;
+    reasons.push(
+      `Amount exceeds the daily limit of ₦${(dailyLimit / 100).toFixed(2)}`
+    );
+  }
+
+  // Large transfer to a new recipient
+  if (amountKobo >= 1000000) {
+    riskScore += 15;
+    reasons.push("Large transfer amount");
+  }
+
+  const result = {
+    allowed: riskScore < 70,
+    score: riskScore,
+    reason: reasons.join("; ") || "No fraud indicators detected",
+    recipient,
+  };
+
+  await logSecurityEvent(
+    identifier,
+    result.allowed ? "transfer_fraud_check_passed" : "transfer_fraud_check_blocked",
+    result.score,
+    {
+      amount_kobo: amountKobo,
+      recipient,
+      reason: result.reason,
+    }
+  );
+
+  return result;
+}
+
+// ---------------------------------------------------------------------
+// INVOICE HELPERS
+// ---------------------------------------------------------------------
+function makeInvoiceNumber() {
+  return `INV-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+}
+
+function makeInvoiceReference() {
+  return `credafi_invoice_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+}
+
+async function createInvoicePaymentLink(
+  businessIdentifier,
+  customerName,
+  customerPhone,
+  amountKobo,
+  description
+) {
+  const invoiceNumber = makeInvoiceNumber();
+  const reference = makeInvoiceReference();
+
+  const customerDigits = String(customerPhone || "").replace(/\D/g, "");
+  const email = customerDigits
+    ? `${customerDigits}@invoice.credafi.ng`
+    : `${invoiceNumber.toLowerCase()}@invoice.credafi.ng`;
+
+  const paystackResponse = await axios.post(
+    "https://api.paystack.co/transaction/initialize",
+    {
+      email,
+      amount: amountKobo,
+      reference,
+      metadata: {
+        type: "credafi_invoice",
+        invoice_number: invoiceNumber,
+        business_identifier: businessIdentifier,
+        customer_name: customerName,
+        customer_phone: customerPhone,
+        description,
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  const paymentUrl = paystackResponse.data.data.authorization_url;
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from("invoices")
+    .insert({
+      business_identifier: businessIdentifier,
+      invoice_number: invoiceNumber,
+      customer_name: customerName,
+      customer_phone: customerPhone,
+      description,
+      amount_kobo: amountKobo,
+      currency: "NGN",
+      status: "sent",
+      payment_reference: reference,
+      payment_url: paymentUrl,
+    })
+    .select()
+    .single();
+
+  if (invoiceError) {
+    console.log("INVOICE CREATE ERROR:", invoiceError);
+    throw new Error("Could not save invoice.");
+  }
+
+  await logSecurityEvent(businessIdentifier, "invoice_created", 0, {
+    invoice_number: invoiceNumber,
+    amount_kobo: amountKobo,
+    customer_name: customerName,
+    payment_reference: reference,
+  });
+
+  return {
+    invoice,
+    invoiceNumber,
+    reference,
+    paymentUrl,
+  };
+}
 
 async function getQoreIdAccessToken() {
   const tokenResp = await axios.post(
@@ -724,7 +976,16 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
           await setState(from, "awaiting_bvn");
           replyText = `Verifying as ${user.full_name}. Reply with your 11-digit BVN.`;
         }
-      } else if (incomingMessage === "9") {
+      } else if (
+  incomingMessage === "invoice" ||
+  incomingMessage === "10"
+) {
+  await setState(from, "awaiting_invoice_customer_name");
+
+  replyText =
+    "Create invoice\n\n" +
+    "What is the customer's name?\n" +
+    "Reply 'menu' anytime to cancel."; else if (incomingMessage === "9") {
         replyText =
           "Help:\n" +
           "1. Check balance\n" +
@@ -1560,7 +1821,123 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
             "We could not verify that NIN right now. Please try again later or reply 'menu' to cancel.";
         }
       }
+// ---------------- CREATE BUSINESS INVOICE ----------------
+} else if (state === "awaiting_invoice_customer_name") {
+  const customerName = incomingMessage.trim();
 
+  if (customerName.length < 2) {
+    replyText = "Please enter the customer's name.";
+  } else {
+    await setState(
+      from,
+      `awaiting_invoice_customer_phone:${customerName}`
+    );
+
+    replyText =
+      "Enter the customer's WhatsApp/phone number.\n" +
+      "Example: 2348012345678";
+  }
+
+} else if (state.startsWith("awaiting_invoice_customer_phone:")) {
+  const customerName = state.split(":").slice(1).join(":");
+  const customerPhone = incomingMessage.replace(/\D/g, "");
+
+  if (customerPhone.length < 10) {
+    replyText =
+      "That phone number looks incomplete. Please enter a valid phone number.";
+  } else {
+    await setState(
+      from,
+      `awaiting_invoice_amount:${customerName}:${customerPhone}`
+    );
+
+    replyText =
+      "What amount should the customer pay?\n" +
+      "Reply with the amount in Naira, for example: 25000";
+  }
+
+} else if (state.startsWith("awaiting_invoice_amount:")) {
+  const parts = state.split(":");
+  const customerName = parts[1];
+  const customerPhone = parts[2];
+  const amountNaira = parseFloat(incomingMessage);
+
+  if (isNaN(amountNaira) || amountNaira <= 0) {
+    replyText =
+      "Please enter a valid amount in Naira, for example: 25000.";
+  } else {
+    const amountKobo = Math.round(amountNaira * 100);
+
+    await setState(
+      from,
+      `awaiting_invoice_description:${customerName}:${customerPhone}:${amountKobo}`
+    );
+
+    replyText =
+      "What is this invoice for?\n" +
+      "Example: Website design deposit";
+  }
+
+} else if (state.startsWith("awaiting_invoice_description:")) {
+  const parts = state.split(":");
+  const customerName = parts[1];
+  const customerPhone = parts[2];
+  const amountKobo = parseInt(parts[3], 10);
+  const description = incomingMessage.trim();
+
+  if (description.length < 2) {
+    replyText = "Please enter a short description for the invoice.";
+  } else {
+    try {
+      const result = await createInvoicePaymentLink(
+        from,
+        customerName,
+        customerPhone,
+        amountKobo,
+        description
+      );
+
+      const customerIdentifier = customerPhone.startsWith("234")
+        ? `whatsapp:+${customerPhone}`
+        : `whatsapp:+${customerPhone.replace(/^0/, "234")}`;
+
+      const invoiceMessage =
+        `CredaFI Invoice ${result.invoiceNumber}\n\n` +
+        `Hello ${customerName},\n` +
+        `You have an invoice of N${(amountKobo / 100).toFixed(2)}.\n` +
+        `For: ${description}\n\n` +
+        `Pay securely here:\n${result.paymentUrl}`;
+
+      try {
+        await sendMessage(customerIdentifier, invoiceMessage);
+      } catch (sendError) {
+        console.log(
+          "INVOICE CUSTOMER MESSAGE ERROR:",
+          sendError.response ? sendError.response.data : sendError.message
+        );
+      }
+
+      await setState(from, "main_menu");
+
+      replyText =
+        `Invoice created successfully.\n\n` +
+        `Invoice number: ${result.invoiceNumber}\n` +
+        `Customer: ${customerName}\n` +
+        `Amount: N${(amountKobo / 100).toFixed(2)}\n\n` +
+        `Payment link:\n${result.paymentUrl}\n\n` +
+        `The link has also been sent to the customer where possible.`;
+    } catch (err) {
+      console.log(
+        "INVOICE PAYMENT LINK ERROR:",
+        err.response ? err.response.data : err.message
+      );
+
+      await setState(from, "main_menu");
+
+      replyText =
+        "Could not create the invoice right now. Please try again later.";
+    }
+  }
       // ---------------- FALLBACK ----------------
     } else {
       await setState(from, "main_menu");
