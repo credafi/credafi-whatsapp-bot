@@ -1221,9 +1221,8 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
         try {
           const accessToken = await getQoreIdAccessToken();
 
-          const consentResp = await axios.post(
+          const consentResp = await axios.get(
             `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
-            {},
             { headers: { Authorization: `Bearer ${accessToken}` } }
           );
 
@@ -1252,9 +1251,8 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
         try {
           const accessToken = await getQoreIdAccessToken();
 
-          const consentResp = await axios.post(
+          const consentResp = await axios.get(
             `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
-            {},
             { headers: { Authorization: `Bearer ${accessToken}` } }
           );
 
@@ -1270,9 +1268,8 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
         try {
           const accessToken = await getQoreIdAccessToken();
 
-          const checkResp = await axios.post(
+          const checkResp = await axios.get(
             `https://api.qoreid.com/v1/ng/identities/bvn-consent/${bvn}`,
-            {},
             { headers: { Authorization: `Bearer ${accessToken}` } }
           );
 
