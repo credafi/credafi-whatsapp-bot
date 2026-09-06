@@ -101,6 +101,32 @@ app.post(
               2
             )} has been added to your wallet.`
           );
+        } else {
+          // Not a wallet-funding payment — check whether it's an invoice payment instead.
+          const { data: invoice, error: invoiceError } = await supabase
+            .from("invoices")
+            .select("*")
+            .eq("reference", reference)
+            .single();
+
+          console.log("INVOICE LOOKUP:", { reference, invoice, invoiceError });
+
+          if (invoice && invoice.status !== "success") {
+            await supabase
+              .from("invoices")
+              .update({ status: "success" })
+              .eq("reference", reference);
+
+            await sendMessage(
+              invoice.created_by,
+              `Invoice paid! ${invoice.customer_name} paid N${(amountKobo / 100).toFixed(2)} for "${invoice.description}".`
+            );
+
+            await sendMessage(
+              invoice.customer_number,
+              `Payment received — thank you, ${invoice.customer_name}!`
+            );
+          }
         }
       }
 
@@ -235,7 +261,10 @@ async function logTransaction(
   type,
   amountKobo,
   counterparty,
-  reference
+  reference,
+  riskScore = 0,
+  riskReason = null,
+  status = "completed"
 ) {
   const { error } = await supabase.from("transactions").insert({
     whatsapp_number: identifier,
@@ -243,11 +272,16 @@ async function logTransaction(
     amount: amountKobo,
     counterparty,
     reference,
+    risk_score: riskScore,
+    risk_reason: riskReason,
+    status,
   });
 
   console.log("TRANSACTION LOGGED:", {
     type,
     amountKobo,
+    riskScore,
+    status,
     error,
   });
 }
@@ -296,8 +330,10 @@ async function sendMessage(identifier, text) {
   console.log("SEND MESSAGE: unknown identifier format:", identifier);
 }
 
+// FIX: scoped to Nigeria/NGN explicitly so bank codes match what
+// /bank/resolve expects.
 async function getBankListText() {
-  const banksResp = await axios.get("https://api.paystack.co/bank", {
+  const banksResp = await axios.get("https://api.paystack.co/bank?country=nigeria&currency=NGN", {
     headers: {
       Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
     },
@@ -382,6 +418,91 @@ async function getQoreIdAccessToken() {
   }
 
   return tokenResp.data.accessToken;
+}
+
+// ---------------------------------------------------------------------
+// FRAUD CONTROLS
+// ---------------------------------------------------------------------
+async function logSecurityEvent(identifier, eventType, details) {
+  const { error } = await supabase.from("security_events").insert({
+    whatsapp_number: identifier,
+    event_type: eventType,
+    details,
+  });
+  console.log("SECURITY EVENT LOGGED:", { eventType, error });
+}
+
+// Checks limits/blocks and flags high-risk transfers for manual review
+// instead of letting them proceed. Called after PIN confirmation, before
+// any money actually moves.
+async function evaluateTransferRisk(identifier, user, amountKobo, recipientDescriptor) {
+  if (user.is_transfer_blocked) {
+    await logSecurityEvent(identifier, "blocked_attempt", `Account blocked. Attempted amount: ${amountKobo}`);
+    return { blocked: true, reason: "Your account is currently restricted from sending money. Please contact support." };
+  }
+
+  if (user.per_transfer_limit_kobo && amountKobo > user.per_transfer_limit_kobo) {
+    await logSecurityEvent(identifier, "blocked_attempt", `Exceeded per-transfer limit. Amount: ${amountKobo}, limit: ${user.per_transfer_limit_kobo}`);
+    return { blocked: true, reason: `This exceeds your per-transfer limit of N${(user.per_transfer_limit_kobo / 100).toFixed(2)}.` };
+  }
+
+  if (user.daily_transfer_limit_kobo) {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const { data: todaysSends } = await supabase
+      .from("transactions")
+      .select("amount")
+      .eq("whatsapp_number", identifier)
+      .eq("type", "send")
+      .gte("created_at", startOfDay.toISOString());
+    const todayTotal = (todaysSends || []).reduce((sum, t) => sum + t.amount, 0);
+    if (todayTotal + amountKobo > user.daily_transfer_limit_kobo) {
+      await logSecurityEvent(identifier, "blocked_attempt", `Exceeded daily limit. Today so far: ${todayTotal}, attempted: ${amountKobo}, limit: ${user.daily_transfer_limit_kobo}`);
+      return { blocked: true, reason: `This would exceed your daily transfer limit of N${(user.daily_transfer_limit_kobo / 100).toFixed(2)}.` };
+    }
+  }
+
+  let riskScore = 0;
+  const reasons = [];
+
+  const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const { data: recentSimilar } = await supabase
+    .from("transactions")
+    .select("*")
+    .eq("whatsapp_number", identifier)
+    .eq("type", "send")
+    .eq("counterparty", recipientDescriptor)
+    .eq("amount", amountKobo)
+    .gte("created_at", tenMinAgo);
+  if (recentSimilar && recentSimilar.length > 0) {
+    riskScore += 50;
+    reasons.push("Repeated identical transfer within 10 minutes");
+  }
+
+  if (amountKobo >= 50000000) { // N500,000+
+    riskScore += 30;
+    reasons.push("Large transfer amount");
+  }
+
+  const needsReview = riskScore >= 50;
+  if (needsReview) {
+    await logSecurityEvent(identifier, "flagged_for_review", `${reasons.join("; ")}. Amount: ${amountKobo}`);
+  }
+
+  return { blocked: false, needsReview, riskScore, riskReason: reasons.length ? reasons.join("; ") : null };
+}
+
+// ---------------------------------------------------------------------
+// INVOICING
+// ---------------------------------------------------------------------
+async function createInvoicePaymentLink(customerNumber, amountKobo, reference) {
+  const digitsOnly = customerNumber.replace(/\D/g, "");
+  const resp = await axios.post(
+    "https://api.paystack.co/transaction/initialize",
+    { email: `${digitsOnly}@credafi.ng`, amount: amountKobo, reference },
+    { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+  );
+  return resp.data.data.authorization_url;
 }
 
 // ---------------------------------------------------------------------
@@ -614,9 +735,63 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
           "6. Account details\n" +
           "7. Verify bank account\n" +
           "8. Verify identity\n\n" +
-          "Reply 'menu' at any time to return here.";
+          "Reply 'menu' at any time to return here. Reply 'invoice' to create a customer invoice.";
+      } else if (incomingMessage.toLowerCase() === "invoice") {
+        await setState(from, "awaiting_invoice_details");
+        replyText =
+          "Let's create an invoice. Reply in this exact format:\n" +
+          "Customer name | Customer WhatsApp number | Amount in Naira | Description\n\n" +
+          "Example:\nAda Okafor | 2348012345678 | 5000 | Payment for hair styling";
       } else {
         replyText = "Sorry, I did not understand that. Reply 'menu' for options.";
+      }
+
+      // ---------------- INVOICING ----------------
+    } else if (state === "awaiting_invoice_details") {
+      const parts = incomingMessage.split("|").map((p) => p.trim());
+
+      if (parts.length !== 4) {
+        replyText =
+          "Please use the exact format:\nCustomer name | Customer WhatsApp number | Amount in Naira | Description";
+      } else {
+        const [customerName, customerNumberRaw, amountStr, description] = parts;
+        const amountNaira = parseFloat(amountStr);
+        const customerNumber = `whatsapp:+${customerNumberRaw.replace(/\D/g, "")}`;
+
+        if (isNaN(amountNaira) || amountNaira <= 0) {
+          replyText = "That amount doesn't look valid. Please try again with the full format.";
+        } else {
+          const amountKobo = Math.round(amountNaira * 100);
+          const reference = `credafi_invoice_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+
+          try {
+            const authUrl = await createInvoicePaymentLink(customerNumber, amountKobo, reference);
+
+            await supabase.from("invoices").insert({
+              created_by: from,
+              customer_name: customerName,
+              customer_number: customerNumber,
+              amount_kobo: amountKobo,
+              description,
+              reference,
+              status: "pending",
+            });
+
+            // Note: on WhatsApp sandbox, this only reaches numbers that have
+            // joined your sandbox — a production sender doesn't have this limit.
+            await sendMessage(
+              customerNumber,
+              `Hi ${customerName}, you have an invoice from CredaFI for N${amountNaira.toFixed(2)} (${description}).\nPay here: ${authUrl}`
+            );
+
+            replyText = `Invoice sent to ${customerName}! I'll let you know once it's paid.`;
+          } catch (err) {
+            console.log("INVOICE CREATE ERROR:", err.response ? err.response.data : err.message);
+            replyText = "Something went wrong creating that invoice. Please try again.";
+          }
+
+          await setState(from, "main_menu");
+        }
       }
 
       // ---------------- BENEFICIARIES ----------------
@@ -907,48 +1082,58 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
           if (senderWallet.balance_kobo < amountKobo) {
             replyText = "Insufficient balance. Transfer cancelled.";
           } else {
-            const recipientWallet = await getOrCreateWallet(recipientNumber);
+            const risk = await evaluateTransferRisk(from, user, amountKobo, recipientNumber);
 
-            await supabase
-              .from("wallets")
-              .update({
-                balance_kobo: senderWallet.balance_kobo - amountKobo,
-              })
-              .eq("whatsapp_number", from);
+            if (risk.blocked) {
+              replyText = risk.reason;
+            } else if (risk.needsReview) {
+              await logTransaction(
+                from, "send", amountKobo, recipientNumber, null,
+                risk.riskScore, risk.riskReason, "pending_review"
+              );
+              replyText =
+                "This transfer looks unusual, so it's been placed under review instead of sent immediately. We'll follow up shortly.";
+            } else {
+              const recipientWallet = await getOrCreateWallet(recipientNumber);
 
-            await supabase
-              .from("wallets")
-              .update({
-                balance_kobo: recipientWallet.balance_kobo + amountKobo,
-              })
-              .eq("whatsapp_number", recipientNumber);
+              await supabase
+                .from("wallets")
+                .update({
+                  balance_kobo: senderWallet.balance_kobo - amountKobo,
+                })
+                .eq("whatsapp_number", from);
 
-            await logTransaction(
-              from,
-              "send",
-              amountKobo,
-              recipientNumber,
-              null
-            );
+              await supabase
+                .from("wallets")
+                .update({
+                  balance_kobo: recipientWallet.balance_kobo + amountKobo,
+                })
+                .eq("whatsapp_number", recipientNumber);
 
-            await logTransaction(
-              recipientNumber,
-              "receive",
-              amountKobo,
-              from,
-              null
-            );
+              await logTransaction(
+                from, "send", amountKobo, recipientNumber, null,
+                risk.riskScore, risk.riskReason
+              );
 
-            replyText = `N${(amountKobo / 100).toFixed(
-              2
-            )} sent successfully!`;
+              await logTransaction(
+                recipientNumber,
+                "receive",
+                amountKobo,
+                from,
+                null
+              );
 
-            await sendMessage(
-              recipientNumber,
-              `You've received N${(amountKobo / 100).toFixed(
+              replyText = `N${(amountKobo / 100).toFixed(
                 2
-              )} on CredaFI!`
-            );
+              )} sent successfully!`;
+
+              await sendMessage(
+                recipientNumber,
+                `You've received N${(amountKobo / 100).toFixed(
+                  2
+                )} on CredaFI!`
+              );
+            }
           }
 
           await setState(from, "main_menu");
@@ -960,106 +1145,132 @@ async function handleIncomingMessage(from, incomingMessage, options = {}) {
             await setState(from, "main_menu");
             replyText = "Insufficient balance. Transfer cancelled.";
           } else {
-            try {
-              let recipientCode;
-              let accountName;
-              let bankCode;
-              let accountNumber;
+            let bankCode;
+            let accountNumber;
+            let accountName;
+            let beneficiaryId = null;
 
-              if (source === "saved") {
-                const beneficiaryId = parts[3];
+            if (source === "saved") {
+              beneficiaryId = parts[3];
 
-                const { data: beneficiary, error: beneficiaryError } =
-                  await supabase
-                    .from("beneficiaries")
-                    .select("*")
-                    .eq("id", beneficiaryId)
-                    .single();
+              const { data: beneficiary, error: beneficiaryError } =
+                await supabase
+                  .from("beneficiaries")
+                  .select("*")
+                  .eq("id", beneficiaryId)
+                  .single();
 
-                if (beneficiaryError || !beneficiary) {
-                  throw new Error("Saved beneficiary could not be found.");
-                }
-
+              if (beneficiaryError || !beneficiary) {
+                await setState(from, "main_menu");
+                replyText = "Saved beneficiary could not be found. Please try again.";
+              } else {
                 bankCode = beneficiary.bank_code;
                 accountNumber = beneficiary.account_number;
                 accountName = beneficiary.account_name;
-                recipientCode = beneficiary.paystack_recipient_code;
+              }
+            } else {
+              bankCode = parts[3];
+              accountNumber = parts[4];
+              accountName = parts.slice(5, parts.length - 1).join(":");
+            }
 
-                if (!recipientCode) {
-                  recipientCode = await createTransferRecipient(
-                    accountName,
-                    accountNumber,
-                    bankCode
+            if (accountNumber) {
+              const risk = await evaluateTransferRisk(from, user, amountKobo, accountNumber);
+
+              if (risk.blocked) {
+                replyText = risk.reason;
+                await setState(from, "main_menu");
+              } else if (risk.needsReview) {
+                await logTransaction(
+                  from, "send", amountKobo, accountName, null,
+                  risk.riskScore, risk.riskReason, "pending_review"
+                );
+                replyText =
+                  "This transfer looks unusual, so it's been placed under review instead of sent immediately. We'll follow up shortly.";
+                await setState(from, "main_menu");
+              } else {
+                try {
+                  let recipientCode;
+
+                  if (source === "saved") {
+                    const { data: beneficiary } = await supabase
+                      .from("beneficiaries")
+                      .select("paystack_recipient_code")
+                      .eq("id", beneficiaryId)
+                      .single();
+
+                    recipientCode = beneficiary.paystack_recipient_code;
+
+                    if (!recipientCode) {
+                      recipientCode = await createTransferRecipient(
+                        accountName,
+                        accountNumber,
+                        bankCode
+                      );
+
+                      await supabase
+                        .from("beneficiaries")
+                        .update({ paystack_recipient_code: recipientCode })
+                        .eq("id", beneficiaryId);
+                    }
+                  } else {
+                    recipientCode = await createTransferRecipient(
+                      accountName,
+                      accountNumber,
+                      bankCode
+                    );
+                  }
+
+                  const reference = `credafi_transfer_${Date.now()}_${Math.floor(
+                    Math.random() * 10000
+                  )}`;
+
+                  const transferResult = await initiatePaystackTransfer(
+                    recipientCode,
+                    amountKobo,
+                    "CredaFI transfer",
+                    reference
                   );
 
                   await supabase
-                    .from("beneficiaries")
-                    .update({ paystack_recipient_code: recipientCode })
-                    .eq("id", beneficiaryId);
+                    .from("wallets")
+                    .update({
+                      balance_kobo: senderWallet.balance_kobo - amountKobo,
+                    })
+                    .eq("whatsapp_number", from);
+
+                  await logTransaction(
+                    from, "send", amountKobo, accountName, reference,
+                    risk.riskScore, risk.riskReason
+                  );
+
+                  replyText = `N${(amountKobo / 100).toFixed(
+                    2
+                  )} sent to ${accountName}. Status: ${transferResult.status}.`;
+
+                  if (source === "new") {
+                    await setState(
+                      from,
+                      `awaiting_save_beneficiary:${bankCode}:${accountNumber}:${accountName}`
+                    );
+
+                    replyText +=
+                      "\n\nSave this account as a beneficiary? Reply 'yes' or 'menu'.";
+                  } else {
+                    await setState(from, "main_menu");
+                  }
+                } catch (err) {
+                  console.log(
+                    "TRANSFER ERROR:",
+                    err.response ? err.response.data : err.message
+                  );
+
+                  await setState(from, "main_menu");
+
+                  replyText =
+                    "Something went wrong sending this transfer. Please try again later.";
                 }
-              } else {
-                bankCode = parts[3];
-                accountNumber = parts[4];
-                accountName = parts.slice(5, parts.length - 1).join(":");
-
-                recipientCode = await createTransferRecipient(
-                  accountName,
-                  accountNumber,
-                  bankCode
-                );
               }
-
-              const reference = `credafi_transfer_${Date.now()}_${Math.floor(
-                Math.random() * 10000
-              )}`;
-
-              const transferResult = await initiatePaystackTransfer(
-                recipientCode,
-                amountKobo,
-                "CredaFI transfer",
-                reference
-              );
-
-              await supabase
-                .from("wallets")
-                .update({
-                  balance_kobo: senderWallet.balance_kobo - amountKobo,
-                })
-                .eq("whatsapp_number", from);
-
-              await logTransaction(
-                from,
-                "send",
-                amountKobo,
-                accountName,
-                reference
-              );
-
-              replyText = `N${(amountKobo / 100).toFixed(
-                2
-              )} sent to ${accountName}. Status: ${transferResult.status}.`;
-
-              if (source === "new") {
-                await setState(
-                  from,
-                  `awaiting_save_beneficiary:${bankCode}:${accountNumber}:${accountName}`
-                );
-
-                replyText +=
-                  "\n\nSave this account as a beneficiary? Reply 'yes' or 'menu'.";
-              } else {
-                await setState(from, "main_menu");
-              }
-            } catch (err) {
-              console.log(
-                "TRANSFER ERROR:",
-                err.response ? err.response.data : err.message
-              );
-
-              await setState(from, "main_menu");
-
-              replyText =
-                "Something went wrong sending this transfer. Please try again later.";
             }
           }
         }
